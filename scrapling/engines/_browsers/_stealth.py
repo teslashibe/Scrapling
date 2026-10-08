@@ -1,6 +1,6 @@
 from random import randint
 from re import compile as re_compile
-from time import sleep as time_sleep
+from time import monotonic, sleep as time_sleep
 from asyncio import sleep as asyncio_sleep
 
 from playwright.sync_api import Locator, Page
@@ -9,7 +9,7 @@ from patchright.sync_api import sync_playwright
 from patchright.async_api import async_playwright
 
 from scrapling.core.utils import log
-from scrapling.core._types import Any, List, Optional, ProxyType, Unpack
+from scrapling.core._types import Any, Dict, List, Optional, ProxyType, Unpack
 from scrapling.engines.toolbelt.proxy_rotation import is_proxy_error
 from scrapling.engines.toolbelt.convertor import Response, ResponseFactory
 from scrapling.engines._browsers._types import StealthSession, StealthFetchParams
@@ -57,6 +57,8 @@ class StealthySession(SyncSession, StealthySessionMixin):
         :param timezone_id: Changes the timezone of the browser. Defaults to the system timezone.
         :param wait_selector_state: The state to wait for the selector given with `wait_selector`. The default state is `attached`.
         :param solve_cloudflare: Solves all types of the Cloudflare's Turnstile/Interstitial challenges before returning the response to you.
+        :param solve_antibot: Detects DataDome, HUMAN (PerimeterX), Akamai, Imperva, AWS WAF, Kasada and Cloudflare challenges after navigation, solves them within the timeout, and records the outcome in `response.meta["antibot"]`.
+        :param captcha_solver: A `SolverRouter` with your captcha-solver keys (CapMonster Cloud, CapSolver, 2Captcha), used by `solve_antibot` for the captchas a browser can't pass alone.
         :param real_chrome: If you have a Chrome browser installed on your device, enable this, and the Fetcher will launch an instance of your browser and use it.
         :param hide_canvas: Add random noise to canvas operations to prevent fingerprinting.
         :param block_webrtc: Forces WebRTC to respect proxy settings to prevent local IP address leak.
@@ -86,10 +88,10 @@ class StealthySession(SyncSession, StealthySessionMixin):
                         assert self.browser is not None
                         self.context = self.browser.new_context(**self._context_options)
                 elif self._config.proxy_rotator:
-                    self.browser = self.playwright.chromium.launch(**self._browser_options)
+                    self.browser = self.playwright.chromium.launch(**self._launch_options())
                 else:
                     persistent_options = (
-                        self._browser_options | self._context_options | {"user_data_dir": self._user_data_dir}
+                        self._launch_options() | self._context_options | {"user_data_dir": self._user_data_dir}
                     )
                     self.context = self.playwright.chromium.launch_persistent_context(**persistent_options)
 
@@ -210,6 +212,8 @@ class StealthySession(SyncSession, StealthySessionMixin):
         :param network_idle: Wait for the page until there are no network connections for at least 500 ms.
         :param load_dom: Enabled by default, wait for all JavaScript on page(s) to fully load and execute.
         :param solve_cloudflare: Solves all types of the Cloudflare's Turnstile/Interstitial challenges before returning the response to you.
+        :param solve_antibot: Detects DataDome, HUMAN (PerimeterX), Akamai, Imperva, AWS WAF, Kasada and Cloudflare challenges after navigation, solves them within the timeout, and records the outcome in `response.meta["antibot"]`.
+        :param captcha_solver: A `SolverRouter` with your captcha-solver keys (CapMonster Cloud, CapSolver, 2Captcha), used by `solve_antibot` for the captchas a browser can't pass alone.
         :param selector_config: The arguments that will be passed in the end while creating the final Selector's class.
         :param proxy: Static proxy to override rotator and session proxy. A new browser context will be created and used with it.
         :return: A `Response` object.
@@ -226,6 +230,7 @@ class StealthySession(SyncSession, StealthySessionMixin):
         )
 
         for attempt in range(self._config.retries):
+            started = monotonic()
             proxy: Optional[ProxyType] = None
             if self._config.proxy_rotator and static_proxy is None:
                 proxy = self._config.proxy_rotator.get_proxy()
@@ -252,6 +257,9 @@ class StealthySession(SyncSession, StealthySessionMixin):
                         except Exception as e:  # pragma: no cover
                             log.error(f"Error executing page_setup: {e}")
 
+                    if params.solve_antibot:
+                        self._antibot_prepare(page)
+
                     try:
                         first_response = page.goto(url, referer=referer)
                         self._wait_for_page_stability(page, params.load_dom, params.network_idle)
@@ -263,6 +271,10 @@ class StealthySession(SyncSession, StealthySessionMixin):
                             self._cloudflare_solver(page)
                             # Make sure the page is fully loaded after the captcha
                             self._wait_for_page_stability(page, params.load_dom, params.network_idle)
+
+                        antibot: Optional[Dict[str, Any]] = None
+                        if params.solve_antibot:
+                            antibot = self._antibot_solve(page, first_response, final_response, params, started)
 
                         if params.page_action:
                             try:
@@ -280,12 +292,15 @@ class StealthySession(SyncSession, StealthySessionMixin):
 
                         page.wait_for_timeout(params.wait)
 
+                        meta: Dict[str, Any] = {"proxy": proxy}
+                        if antibot is not None:
+                            meta["antibot"] = antibot
                         response = ResponseFactory.from_playwright_response(
                             page,
                             first_response,
                             final_response[0],
                             params.selector_config,
-                            meta={"proxy": proxy},
+                            meta=meta,
                             xhr_captured=xhr_captured,
                         )
                         return response
@@ -307,8 +322,50 @@ class StealthySession(SyncSession, StealthySessionMixin):
                             raise
                 finally:
                     page.remove_listener("response", handler)
+                    if params.solve_antibot:
+                        self._antibot_release(page)
 
         raise RuntimeError("Request failed")  # pragma: no cover
+
+    def _antibot_prepare(self, page: Page) -> None:
+        """Harden the page and attach the anti-bot watchers before it navigates (see `antibot.runner`)."""
+        from scrapling.engines.antibot._sync_bridge import run_sync
+        from scrapling.engines.antibot.runner import prepare_page
+
+        try:
+            run_sync(page, lambda view: prepare_page(view, harden=True, locale=self._config.locale))
+        except Exception as e:  # pragma: no cover
+            log.error(f"Error preparing the page for anti-bot solving: {e}")
+
+    def _antibot_solve(
+        self, page: Page, first_response: Any, final_response: List, params: Any, started: float
+    ) -> Dict[str, Any]:
+        """Detect a bot-protection vendor on the loaded page and solve it within the fetch's timeout."""
+        from scrapling.engines.antibot._sync_bridge import run_sync, wrap
+        from scrapling.engines.antibot.runner import antibot_deadline, solve_page
+
+        try:
+            return run_sync(
+                page,
+                lambda view: solve_page(
+                    view,
+                    document=lambda: wrap(final_response[0] or first_response),
+                    deadline=antibot_deadline(started, params.timeout),
+                    solver=params.captcha_solver,
+                    log=log,
+                ),
+            )
+        finally:
+            # Handlers shorten the page's timeouts to their deadline; give the rest of the fetch its own back.
+            page.set_default_navigation_timeout(params.timeout)
+            page.set_default_timeout(params.timeout)
+
+    @staticmethod
+    def _antibot_release(page: Page) -> None:
+        from scrapling.engines.antibot._sync_bridge import wrap
+        from scrapling.engines.antibot.runner import release_page
+
+        release_page(wrap(page))
 
 
 class AsyncStealthySession(AsyncSession, StealthySessionMixin):
@@ -343,6 +400,8 @@ class AsyncStealthySession(AsyncSession, StealthySessionMixin):
         :param timezone_id: Changes the timezone of the browser. Defaults to the system timezone.
         :param wait_selector_state: The state to wait for the selector given with `wait_selector`. The default state is `attached`.
         :param solve_cloudflare: Solves all types of the Cloudflare's Turnstile/Interstitial challenges before returning the response to you.
+        :param solve_antibot: Detects DataDome, HUMAN (PerimeterX), Akamai, Imperva, AWS WAF, Kasada and Cloudflare challenges after navigation, solves them within the timeout, and records the outcome in `response.meta["antibot"]`.
+        :param captcha_solver: A `SolverRouter` with your captcha-solver keys (CapMonster Cloud, CapSolver, 2Captcha), used by `solve_antibot` for the captchas a browser can't pass alone.
         :param real_chrome: If you have a Chrome browser installed on your device, enable this, and the Fetcher will launch an instance of your browser and use it.
         :param hide_canvas: Add random noise to canvas operations to prevent fingerprinting.
         :param block_webrtc: Forces WebRTC to respect proxy settings to prevent local IP address leak.
@@ -371,10 +430,10 @@ class AsyncStealthySession(AsyncSession, StealthySessionMixin):
                         assert self.browser is not None
                         self.context = await self.browser.new_context(**self._context_options)
                 elif self._config.proxy_rotator:
-                    self.browser = await self.playwright.chromium.launch(**self._browser_options)
+                    self.browser = await self.playwright.chromium.launch(**self._launch_options())
                 else:
                     persistent_options = (
-                        self._browser_options | self._context_options | {"user_data_dir": self._user_data_dir}
+                        self._launch_options() | self._context_options | {"user_data_dir": self._user_data_dir}
                     )
                     self.context = await self.playwright.chromium.launch_persistent_context(**persistent_options)
 
@@ -497,6 +556,8 @@ class AsyncStealthySession(AsyncSession, StealthySessionMixin):
         :param network_idle: Wait for the page until there are no network connections for at least 500 ms.
         :param load_dom: Enabled by default, wait for all JavaScript on page(s) to fully load and execute.
         :param solve_cloudflare: Solves all types of the Cloudflare's Turnstile/Interstitial challenges before returning the response to you.
+        :param solve_antibot: Detects DataDome, HUMAN (PerimeterX), Akamai, Imperva, AWS WAF, Kasada and Cloudflare challenges after navigation, solves them within the timeout, and records the outcome in `response.meta["antibot"]`.
+        :param captcha_solver: A `SolverRouter` with your captcha-solver keys (CapMonster Cloud, CapSolver, 2Captcha), used by `solve_antibot` for the captchas a browser can't pass alone.
         :param selector_config: The arguments that will be passed in the end while creating the final Selector's class.
         :param proxy: Static proxy to override rotator and session proxy. A new browser context will be created and used with it.
         :return: A `Response` object.
@@ -514,6 +575,7 @@ class AsyncStealthySession(AsyncSession, StealthySessionMixin):
         )
 
         for attempt in range(self._config.retries):
+            started = monotonic()
             proxy: Optional[ProxyType] = None
             if self._config.proxy_rotator and static_proxy is None:
                 proxy = self._config.proxy_rotator.get_proxy()
@@ -540,6 +602,9 @@ class AsyncStealthySession(AsyncSession, StealthySessionMixin):
                         except Exception as e:  # pragma: no cover
                             log.error(f"Error executing page_setup: {e}")
 
+                    if params.solve_antibot:
+                        await self._antibot_prepare(page)
+
                     try:
                         first_response = await page.goto(url, referer=referer)
                         await self._wait_for_page_stability(page, params.load_dom, params.network_idle)
@@ -551,6 +616,10 @@ class AsyncStealthySession(AsyncSession, StealthySessionMixin):
                             await self._cloudflare_solver(page)
                             # Make sure the page is fully loaded after the captcha
                             await self._wait_for_page_stability(page, params.load_dom, params.network_idle)
+
+                        antibot: Optional[Dict[str, Any]] = None
+                        if params.solve_antibot:
+                            antibot = await self._antibot_solve(page, first_response, final_response, params, started)
 
                         if params.page_action:
                             try:
@@ -568,12 +637,15 @@ class AsyncStealthySession(AsyncSession, StealthySessionMixin):
 
                         await page.wait_for_timeout(params.wait)
 
+                        meta: Dict[str, Any] = {"proxy": proxy}
+                        if antibot is not None:
+                            meta["antibot"] = antibot
                         response = await ResponseFactory.from_async_playwright_response(
                             page,
                             first_response,
                             final_response[0],
                             params.selector_config,
-                            meta={"proxy": proxy},
+                            meta=meta,
                             xhr_captured=xhr_captured,
                         )
                         return response
@@ -595,5 +667,38 @@ class AsyncStealthySession(AsyncSession, StealthySessionMixin):
                             raise
                 finally:
                     page.remove_listener("response", handler)
+                    if params.solve_antibot:
+                        self._antibot_release(page)
 
         raise RuntimeError("Request failed")  # pragma: no cover
+
+    async def _antibot_prepare(self, page: async_Page) -> None:
+        """Harden the page and attach the anti-bot watchers before it navigates (see `antibot.runner`)."""
+        from scrapling.engines.antibot.runner import prepare_page
+
+        await prepare_page(page, harden=True, locale=self._config.locale)
+
+    async def _antibot_solve(
+        self, page: async_Page, first_response: Any, final_response: List, params: Any, started: float
+    ) -> Dict[str, Any]:
+        """Detect a bot-protection vendor on the loaded page and solve it within the fetch's timeout."""
+        from scrapling.engines.antibot.runner import antibot_deadline, solve_page
+
+        try:
+            return await solve_page(
+                page,
+                document=lambda: final_response[0] or first_response,
+                deadline=antibot_deadline(started, params.timeout),
+                solver=params.captcha_solver,
+                log=log,
+            )
+        finally:
+            # Handlers shorten the page's timeouts to their deadline; give the rest of the fetch its own back.
+            page.set_default_navigation_timeout(params.timeout)
+            page.set_default_timeout(params.timeout)
+
+    @staticmethod
+    def _antibot_release(page: async_Page) -> None:
+        from scrapling.engines.antibot.runner import release_page
+
+        release_page(page)

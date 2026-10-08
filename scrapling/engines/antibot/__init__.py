@@ -3,6 +3,10 @@
 ``detect(signal)`` names the vendor and kind of challenge on a page (Cloudflare, AWS WAF, DataDome, Kasada,
 HUMAN/PerimeterX, Akamai, Imperva); ``get(vendor).solve(page, detection, ...)`` tries to get past it inside a
 deadline. See :mod:`scrapling.engines.antibot.base` for the contract every handler follows.
+
+The stealth fetchers run all of this for you with ``solve_antibot=True`` (:mod:`scrapling.engines.antibot.runner`),
+and hand interactive captchas to operator-paid solvers given as ``captcha_solver``
+(:class:`scrapling.engines.antibot.solvers.SolverRouter`).
 """
 
 from scrapling.engines.antibot.base import (

@@ -55,7 +55,9 @@ __all__ = [
 #: * ``ban``: the vendor has banned this client or IP; retrying only makes it worse.
 Kind = Literal["device_check", "challenge", "captcha", "block", "ban"]
 KINDS: Tuple[str, ...] = ("device_check", "challenge", "captcha", "block", "ban")
-#: Kinds a handler may try to get past; ``block`` and ``ban`` are final verdicts for this visit.
+#: Kinds a handler may try to get past; ``block`` and ``ban`` are final verdicts for this visit. The session runner
+#: (:mod:`scrapling.engines.antibot.runner`) still calls ``solve`` for a ``block``, so a handler with a same-origin
+#: retry (Akamai's warm-up) can use it; other handlers return at once for kinds they cannot change.
 SOLVABLE_KINDS = frozenset({"device_check", "challenge", "captcha"})
 
 #: The longest DOM head a signal keeps (2 MiB of characters).
