@@ -243,12 +243,16 @@ class Detection:
     :param kind: See :data:`Kind`.
     :param rule: A stable identifier of the rule that matched, such as ``dd.device``.
     :param details: Rule-specific facts for the solver (script URLs, site keys, parsed vendor objects).
+    :param signal: The :class:`Signal` the detection was made from (set by
+        :func:`~scrapling.engines.antibot.detect.detect`). Re-checks during a solve use its status and headers
+        until a new main-frame document arrives: a page that never reloaded is still the document that was detected.
     """
 
     vendor: str
     kind: Kind
     rule: str
     details: Dict[str, Any] = field(default_factory=dict)
+    signal: Optional[Signal] = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -259,12 +263,17 @@ class SolveResult:
     :param reason: A short machine-readable reason (``solved``, ``timeout``, ``ban``, ``unsolved:<what>``...).
     :param cookies: Names of the vendor clearance cookies the solve earned or refreshed (never their values).
     :param used_solver: The captcha solver provider that was used, if any.
+    :param solver_kind: For an unsolved result only: the captcha-solver kind (``turnstile``, ``hcaptcha``,
+        ``awswaf``, ``datadome_slider``...) that would get the page further, when the handler stopped at a captcha a
+        solver can act on (none was given, it does not offer the kind, or its answer was rejected). ``None`` when no
+        solver could help (a ban, a block, a press-and-hold or an unsupported widget).
     """
 
     solved: bool
     reason: str
     cookies: List[str] = field(default_factory=list)
     used_solver: Optional[str] = None
+    solver_kind: Optional[str] = None
 
 
 class Handler(Protocol):

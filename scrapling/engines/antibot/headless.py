@@ -18,8 +18,11 @@ on Chrome for Testing 155.0.8059.39 with Patchright 1.63 on an Apple Silicon Mac
 What fixes them, all through CDP on the page's own session (no init scripts, nothing in the page's JavaScript):
 
 * ``Emulation.updateScreen`` (headless only) replaces the virtual screen itself, so every frame and worker reads the
-  real display natively: size, work area (menu bar and Dock), ``colorDepth`` and scale. Extra displays are added
-  with ``Emulation.addScreen`` so ``screen.isExtended`` matches a multi-monitor desk.
+  same display natively: size, work area (menu bar and Dock), ``colorDepth`` and scale. Which display that is
+  follows :func:`set_display_policy`: by default one common display for the platform (:func:`canonical_displays`),
+  so pages never learn the machine's own monitors, their layout or its menu bar and Dock settings; with ``"host"``
+  the machine's real displays, extra ones added with ``Emulation.addScreen`` so ``screen.isExtended`` matches a
+  multi-monitor desk. The frames only need to agree with each other, which either policy gives.
 * ``Browser.setWindowBounds`` (headless only) gives the window a toolbar's height above the page and a normal
   position inside the work area.
 * ``Emulation.setUserAgentOverride`` with the browser's own version and full UA client-hint metadata is sent to the
@@ -44,14 +47,15 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
-import logging
 import platform as _platform
 import re
 import subprocess
 import sys
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from weakref import WeakKeyDictionary
+
+from scrapling.core._types import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from scrapling.core.utils import log
 
 __all__ = [
     "DEFAULT_BRAND",
@@ -67,13 +71,15 @@ __all__ = [
     "harden_page",
     "get_hardening",
     "host_displays",
+    "canonical_displays",
+    "display_policy",
+    "set_display_policy",
+    "session_displays",
     "launch_args",
     "quiet_evaluate",
     "scrub_headless_ua",
     "accept_language_for",
 ]
-
-log = logging.getLogger("scrapling")
 
 #: The brand real Chrome adds to the client-hint brand list. Chrome for Testing and Chromium send only "Chromium"
 #: and the GREASE brand, which no stock Chrome on a desktop does. ``None`` keeps the binary's own list.
@@ -216,12 +222,16 @@ class Display:
         )
 
 
-#: Fallbacks when the display cannot be read: a 14" MacBook Pro at default scaling with the Dock hidden, and a
-#: 1080p desktop with a taskbar elsewhere.
+#: The common displays the browser describes by default (and the fallbacks when the host's cannot be read): a 14"
+#: MacBook Pro at default scaling with the Dock hidden, and a 1080p desktop with a taskbar at the bottom.
 DEFAULT_MAC_DISPLAY = Display(1512, 982, scale=2.0, color_depth=30, inset_top=34)
 DEFAULT_DISPLAY = Display(1920, 1080, scale=1.0, color_depth=24, inset_bottom=48)
 
+#: Display policies for :func:`set_display_policy`.
+DISPLAY_POLICIES: Tuple[str, ...] = ("canonical", "host")
+
 _HOST_DISPLAYS: List[Tuple[Display, ...]] = []
+_DISPLAY_POLICY: List[str] = ["canonical"]
 
 
 def _parse_mac_screens(output: str) -> Tuple[Display, ...]:
@@ -272,7 +282,7 @@ def host_displays(refresh: bool = False) -> Tuple[Display, ...]:
     displays: Optional[Tuple[Display, ...]] = None
     if sys.platform == "darwin":
         try:
-            result = subprocess.run(
+            result = subprocess.run(  # nosec B603 - a fixed system binary and a constant script, no shell
                 ["/usr/bin/osascript", "-l", "JavaScript", "-e", _SCREEN_QUERY],
                 capture_output=True,
                 text=True,
@@ -289,6 +299,35 @@ def host_displays(refresh: bool = False) -> Tuple[Display, ...]:
         displays = (DEFAULT_DISPLAY,)
     _HOST_DISPLAYS[:] = [displays]
     return displays
+
+
+def canonical_displays(host: Optional[str] = None) -> Tuple[Display, ...]:
+    """One common display for ``host`` (``sys.platform`` by default): :data:`DEFAULT_MAC_DISPLAY` on macOS,
+    :data:`DEFAULT_DISPLAY` elsewhere. Nothing about the machine's own monitors is read."""
+    return (DEFAULT_MAC_DISPLAY,) if (host or sys.platform) == "darwin" else (DEFAULT_DISPLAY,)
+
+
+def set_display_policy(policy: str) -> None:
+    """Choose the displays a hardened browser describes when no ``displays`` are passed.
+
+    * ``"canonical"`` (the default): one common display (:func:`canonical_displays`). Every frame still sees the same
+      screen, which is all the cross-frame checks compare, and a page learns nothing about the machine's monitors.
+    * ``"host"``: the machine's own displays (:func:`host_displays`), all of them, with their real geometry, menu bar
+      and Dock insets. Only for a browser whose pages may see that.
+    """
+    if policy not in DISPLAY_POLICIES:
+        raise ValueError(f"display policy must be one of {DISPLAY_POLICIES}")
+    _DISPLAY_POLICY[0] = policy
+
+
+def display_policy() -> str:
+    """The current display policy (see :func:`set_display_policy`)."""
+    return _DISPLAY_POLICY[0]
+
+
+def session_displays(host: Optional[str] = None) -> Tuple[Display, ...]:
+    """The displays to describe under the current policy."""
+    return host_displays() if _DISPLAY_POLICY[0] == "host" else canonical_displays(host)
 
 
 def toolbar_height(host: Optional[str] = None) -> int:
@@ -506,8 +545,9 @@ def launch_args(
     user_agent: Optional[str] = None,
     host: Optional[str] = None,
 ) -> List[str]:
-    """Rewrite headless launch ``args`` so the browser starts as the real machine.
+    """Rewrite headless launch ``args`` so the browser starts as one ordinary desktop browser.
 
+    ``displays`` defaults to :func:`session_displays` (one common display unless the policy is ``"host"``).
     Drops :data:`DROP_ARGS`, then adds ``--screen-info`` for the main display, its scale factor, a window of
     ``viewport`` plus the toolbar, an HDR colour profile on a wide-gamut Mac (so ``(color: 10)`` and
     ``(dynamic-range: high)`` agree with ``colorDepth`` 30), and ``--user-agent`` when given (the only switch that
@@ -515,7 +555,7 @@ def launch_args(
     optimisation for the first document, not a requirement.
     """
     host = host or sys.platform
-    displays = tuple(displays or host_displays())
+    displays = tuple(displays or session_displays(host))
     main = displays[0]
     viewport = viewport or default_viewport(main, host)
     out = [a for a in args if a not in DROP_ARGS and not a.startswith(_DROP_PREFIXES)]
@@ -680,7 +720,7 @@ async def harden_page(
 
     :param page: A Patchright/Playwright async ``Page``.
     :param identity: User agent and client hints; read from the browser itself by default.
-    :param displays: Displays to describe; the host's by default (:func:`host_displays`).
+    :param displays: Displays to describe; by default :func:`session_displays` (see :func:`set_display_policy`).
     :param viewport: Page size for the window when the context has no viewport emulation; by default the largest
         common size that fits the main display (:func:`default_viewport`).
     :param brand: Product brand for the client hints when ``identity`` is not given.
@@ -699,7 +739,7 @@ async def harden_page(
         version = await _send(cdp, "Browser.getVersion", None, errors) or {}
         identity = identity or Identity.from_version(version, brand=brand, locale=locale, host=host)
         headless = "HeadlessChrome" in str(version.get("userAgent", ""))
-        displays = tuple(displays or host_displays())
+        displays = tuple(displays or session_displays(host))
         emulated = getattr(page, "viewport_size", None) is not None
 
         if emulated:
@@ -755,12 +795,13 @@ async def harden_page(
                 window = window_bounds(displays[0], viewport, host)
                 await _send(cdp, "Browser.setWindowBounds", {"windowId": target["windowId"], "bounds": window}, errors)
 
-        children = _ChildTargets(cdp, plan)
+        children: Optional[_ChildTargets] = None
+        attacher = _ChildTargets(cdp, plan)
         try:
-            await children.start()
+            await attacher.start()
+            children = attacher
         except Exception as error:
             errors.append(f"Target.setAutoAttach: {error}")
-            children = None
 
         hardening = PageHardening(
             cdp=cdp,

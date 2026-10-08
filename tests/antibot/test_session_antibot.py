@@ -86,11 +86,12 @@ class TestOptions:
 
 
 class _Handler:
-    def __init__(self, vendor, results, delay=0.0, error=None):
+    def __init__(self, vendor, results, delay=0.0, error=None, after=None):
         self.vendor = vendor
         self.results = list(results)
         self.delay = delay
         self.error = error
+        self.after = after
         self.calls = []
 
     def detect(self, s):  # pragma: no cover - detection is faked below
@@ -104,6 +105,8 @@ class _Handler:
             await asyncio.sleep(self.delay)
         if self.error:
             raise self.error
+        if self.after:
+            self.after()
         return self.results.pop(0)
 
 
@@ -170,21 +173,37 @@ class TestSolveLoop:
 
     @pytest.mark.asyncio
     async def test_layered_vendors_are_solved_in_turn(self, fake_loop):
-        imperva = _Handler("imperva", [SolveResult(True, "solved", ["reese84"])])
-        dd = _Handler("datadome", [SolveResult(True, "solved", ["datadome"])])
-        signals = fake_loop([_det("imperva"), _det("datadome", "device_check")], [imperva, dd])
         first = _Response(403, {"x-cdn": "Imperva"})
         reloaded = _Response(200, {"server": "nginx"})
-        docs = [first, first, reloaded]
-        out = await runner.solve_page(object(), document=lambda: docs.pop(0), deadline=monotonic() + 20)
+        current = [first]
+        imperva = _Handler("imperva", [SolveResult(True, "solved", ["reese84"])])
+        dd = _Handler("datadome", [SolveResult(True, "solved", ["datadome"])], after=lambda: current.__setitem__(0, reloaded))
+        signals = fake_loop([_det("imperva"), _det("datadome", "device_check")], [imperva, dd])
+        out = await runner.solve_page(object(), document=lambda: current[0], deadline=monotonic() + 20)
         assert out["solved"] is True and out["vendor"] == "datadome" and out["reason"] == "solved"
         assert [(layer["vendor"], layer["solved"]) for layer in out["layers"]] == [
             ("imperva", True),
             ("datadome", True),
         ]
         assert out["layers"][0]["cookies"] == ["reese84"]
-        # The first re-read had no new document: its status is unknown rather than the challenge's 403.
-        assert signals[0][0] == 403 and signals[1] == (None, {}) and signals[2][0] == 200
+        # Solved in place, no new document: the re-read keeps the detected document's status and headers. After
+        # DataDome reloaded the page, the new document's own status is used.
+        assert signals == [(403, {"x-cdn": "Imperva"}), (403, {"x-cdn": "Imperva"}), (200, {"server": "nginx"})]
+
+    @pytest.mark.asyncio
+    async def test_a_document_that_arrives_during_the_read_is_read_again(self, fake_loop):
+        first = _Response(202, {"x-amzn-waf-action": "challenge"})
+        reloaded = _Response(200, {"server": "nginx"})
+        calls = []
+
+        def document():
+            calls.append(1)
+            return first if len(calls) == 1 else reloaded
+
+        signals = fake_loop([], [])
+        out = await runner.solve_page(object(), document=document, deadline=monotonic() + 20)
+        assert out["reason"] == "none"
+        assert signals == [(202, {"x-amzn-waf-action": "challenge"}), (200, {"server": "nginx"})]
 
     @pytest.mark.asyncio
     async def test_a_vendor_still_there_after_its_solve_is_reported_unsolved(self, fake_loop):
@@ -240,11 +259,87 @@ class TestSolveLoop:
         assert out["layers"][0]["used_solver"] == "capmonster" and out["solver"]["attempts"] == 1
 
     @pytest.mark.asyncio
+    async def test_a_scope_passed_in_is_used_as_it_is(self, fake_loop):
+        """A caller that retries a fetch keeps one budget and one ledger by passing ``router.scope()``."""
+        scope = SolverRouter([]).scope()
+        cf = _Handler("cloudflare", [SolveResult(False, "unsolved:solver_error", solver_kind="turnstile")])
+        fake_loop([_det("cloudflare", "captcha", "cf.turnstile")], [cf])
+        out = await runner.solve_page(object(), document=lambda: None, deadline=monotonic() + 20, solver=scope)
+        assert scope.is_scope and cf.calls[0][2] is scope
+        assert out["layers"][0]["solver_kind"] == "turnstile"
+
+    @pytest.mark.asyncio
     async def test_layers_are_capped(self, fake_loop):
         handlers = [_Handler(v, [SolveResult(True, "solved")]) for v in ("cloudflare", "aws_waf", "kasada", "imperva")]
         fake_loop([_det(h.vendor) for h in handlers], handlers)
         out = await runner.solve_page(object(), document=lambda: None, deadline=monotonic() + 20, max_layers=3)
         assert out["reason"] == "max_layers" and out["solved"] is False and len(out["layers"]) == 4
+
+
+# ------------------------------------------- real detection and handlers: an unchanged page is never solved
+
+_INCIDENT_BLOCK = (
+    "<html><head><title>Access denied</title><style>" + "body{margin:0;padding:0}" * 300 + "</style></head>"
+    "<body><h1>Access denied</h1><p>Error 15. This request was blocked by our security service. "
+    "Incapsula incident ID: 123000450123456789-12345</p></body></html>"
+)
+_DD_HEADER_ONLY = "<html><head><title>x</title></head><body><p>Please enable JS and disable any ad blocker</p></body></html>"
+_AWS_GATE = "<html><body><h1>Forbidden</h1></body></html>"
+
+
+@pytest.fixture
+def unchanged_page(monkeypatch):
+    """A fake page whose document never changes, read the way the runner reads a live one."""
+    from .iak_fakes import FakePage, FakeResponse, no_wander
+
+    async def quiet(page, frame, expression, timeout=2.0):
+        return page.html
+
+    monkeypatch.setattr(runner, "quiet_evaluate", quiet)
+    monkeypatch.setattr(datadome, "quiet_evaluate", quiet)
+    monkeypatch.setattr(_imperva_solver, "wander", no_wander)
+    monkeypatch.setattr(_awswaf_solver, "wander", no_wander)
+    monkeypatch.setattr(_imperva_solver, "BLOCK_PATIENCE", 1.0)
+    monkeypatch.setattr(_awswaf_solver, "TOKEN_STATUS_PATIENCE", 1.0)
+    monkeypatch.setitem(runner.registry._BY_VENDOR, "datadome", datadome.DataDomeHandler(no_frame_grace=1.0))
+
+    def make(html, status, headers, cookies):
+        page = FakePage("https://www.example.test/item", html)
+        page.context.store.update(cookies)
+        response = FakeResponse(page.url, status, headers, frame=page.main_frame)
+
+        async def all_headers():
+            return dict(response.headers)
+
+        response.all_headers = all_headers
+        return page, (lambda: response)
+
+    return make
+
+
+class TestUnchangedPages:
+    CASES = [
+        ("imperva", _INCIDENT_BLOCK, 403, {"x-iinfo": "1-2-3", "x-cdn": "Imperva"}, {"visid_incap_1": "v"}, "blocked"),
+        ("datadome", _DD_HEADER_ONLY, 403, {"x-dd-b": "3", "x-datadome": "protected"}, {"datadome": "same"}, "no_challenge"),
+        ("aws_waf", _AWS_GATE, 403, {}, {"aws-waf-token": "tok"}, "blocked"),
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("vendor,html,status,headers,cookies,reason", CASES, ids=[c[0] for c in CASES])
+    async def test_the_handler_reports_it_unsolved(self, unchanged_page, vendor, html, status, headers, cookies, reason):
+        page, document = unchanged_page(html, status, headers, cookies)
+        out = await runner.solve_page(page, document=document, deadline=monotonic() + 8)
+        assert (out["vendor"], out["solved"], out["reason"]) == (vendor, False, reason), out
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("vendor,html,status,headers,cookies,reason", CASES, ids=[c[0] for c in CASES])
+    async def test_a_handler_that_claims_success_is_caught(
+        self, unchanged_page, monkeypatch, vendor, html, status, headers, cookies, reason
+    ):
+        page, document = unchanged_page(html, status, headers, cookies)
+        monkeypatch.setitem(runner.registry._BY_VENDOR, vendor, _Handler(vendor, [SolveResult(True, "solved")]))
+        out = await runner.solve_page(page, document=document, deadline=monotonic() + 8)
+        assert (out["vendor"], out["solved"], out["reason"]) == (vendor, False, "still_detected"), out
 
 
 # ------------------------------------------------------------------------------------------------ the bridge

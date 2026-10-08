@@ -19,7 +19,7 @@ from __future__ import annotations
 from re import compile as re_compile
 
 from scrapling.core._types import TYPE_CHECKING, Any, Dict, Optional
-from scrapling.engines.antibot.base import Detection, Signal, SolveResult
+from scrapling.engines.antibot.base import Detection, Kind, Signal, SolveResult
 
 if TYPE_CHECKING:  # pragma: no cover
     from scrapling.engines.antibot.solvers.router import SolverRouter
@@ -92,9 +92,9 @@ class ImpervaHandler:
         if not (loader or s.has("incapsula") or (pardon and edge)):
             return None
 
-        def found(kind: str, rule: str, **details: Any) -> Detection:
+        def found(kind: Kind, rule: str, **details: Any) -> Detection:
             details["status"] = s.status
-            return Detection(vendor=self.vendor, kind=kind, rule=rule, details=details)  # type: ignore[arg-type]
+            return Detection(vendor=self.vendor, kind=kind, rule=rule, details=details, signal=s)
 
         incident_frames = [u for u in frames if any(i in u for i in _INCIDENT)]
         if incident_frames or _INCIDENT_FRAME.search(s.html):

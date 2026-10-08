@@ -132,7 +132,7 @@ class AkamaiHandler:
             details["abck"] = abck_state(s.cookies["_abck"])
 
         def found(kind: Kind, rule: str, **extra: Any) -> Detection:
-            return Detection(vendor=self.vendor, kind=kind, rule=rule, details={**details, **extra})
+            return Detection(vendor=self.vendor, kind=kind, rule=rule, details={**details, **extra}, signal=s)
 
         if s.status == 428 and s.has("sec-cp-challenge"):
             return found("challenge", "akamai.sec_cpt", challenge="sec_cpt", **parse_sec_cpt(s.text or s.html))

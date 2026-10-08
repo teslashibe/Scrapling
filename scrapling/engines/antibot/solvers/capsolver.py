@@ -26,7 +26,7 @@ CapSolver does not report per-task cost; costs are estimated from https://www.ca
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple, Type
+from scrapling.core._types import Any, Dict, List, Optional, Tuple, Type
 
 from ._client import CreateTaskSolver, ProxySpec, put, recaptcha_label_id
 from .base import (

@@ -24,13 +24,18 @@ Solving (:meth:`DataDomeHandler.solve`) never generates DataDome payloads; the b
   pointer path.
 * **Ban.** ``t=bv`` (in the verdict, the page URL or a frame URL) stops at once with ``reason="ban"``: solving
   cannot change it and every retry adds to the IP's record.
-* **Slider.** Without a configured solver the handler stops with ``reason="slider"``. With one, the jigsaw variant
-  (``SliderCaptcha``) has its piece and background sent to the solver's recognition task (``datadome_slider``,
-  CapSolver ``VisionEngine``; only images leave the machine), and the "simple" slide-to-target variant (what DataDome
-  served live on 2026-10-08: ``#captcha__frame.simple``, puzzle canvases never drawn) is dragged onto its visible
-  ``.sliderTarget`` without a paid call. The drag goes through ``page.mouse`` and is corrected against the piece's
-  (or handle's) real position while the button is held.
+* **Slider.** The "simple" slide-to-target variant (what DataDome served live on 2026-10-08:
+  ``#captcha__frame.simple``, puzzle canvases never drawn) is dragged onto its visible ``.sliderTarget`` with no
+  solver at all. The jigsaw variant (``SliderCaptcha``) needs the gap's position: with a configured solver its piece
+  and background go to the solver's recognition task (``datadome_slider``, CapSolver ``VisionEngine``; only the two
+  images leave the machine), and without one the handler stops with ``reason="slider"`` and
+  ``solver_kind="datadome_slider"``. The drag goes through ``page.mouse`` and is corrected against the piece's (or
+  handle's) real position while the button is held.
 * **Restricted.** A "restricted" or "blocked" device frame that does not move on stops with ``reason="blocked"``.
+
+A check detected from headers alone (``x-dd-b``, ``x-datadome``) or from DataDome's host in the page leaves no
+verdict in the DOM to watch for, so it only counts as passed on a new ``datadome`` cookie or a new document; a page
+that never changes ends as ``no_challenge``.
 
 DOM reads inside the challenge frames go through
 :func:`~scrapling.engines.antibot.headless.quiet_evaluate` (a CDP isolated world, no user gesture), so reading the
@@ -54,7 +59,7 @@ from re import compile as re_compile
 from time import monotonic
 from urllib.parse import parse_qs, urlsplit
 
-from scrapling.core._types import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from scrapling.core._types import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
 from scrapling.engines.antibot._pagestate import DocumentTracker, bounded, frame_urls, site_cookies
 from scrapling.engines.antibot._pointer import human_path, move_along, sleep_until
 from scrapling.engines.antibot.base import Detection, Kind, Signal, SolveResult, host_matches
@@ -259,9 +264,12 @@ def _center(box: Dict[str, float], origin: Tuple[float, float]) -> Tuple[float, 
 class _Run:
     """Per-solve state."""
 
-    def __init__(self, started: float, initial_cookie: Optional[str]):
+    def __init__(self, started: float, initial_cookie: Optional[str], marked: bool = True):
         self.started = started
         self.initial = initial_cookie
+        #: The detected page carried a verdict in its DOM (``var dd={...}`` or a challenge script) whose removal is
+        #: evidence on its own; a detection from headers or the host string alone needs a cookie or a new document.
+        self.marked = marked
         self.frame_seen: Optional[float] = None
         self.captcha_seen: Optional[float] = None
         self.confirmed = False
@@ -339,7 +347,7 @@ class DataDomeHandler:
             details["frame_url"] = frames[0][0]
 
         def found(kind: Kind, rule: str, **extra: Any) -> Detection:
-            return Detection(vendor=self.vendor, kind=kind, rule=rule, details={**details, **extra})
+            return Detection(vendor=self.vendor, kind=kind, rule=rule, details={**details, **extra}, signal=s)
 
         # A ban first: nothing else matters once the visitor is banned.
         banned_frame = next((u for u, k in frames if k == "ban"), None)
@@ -362,7 +370,7 @@ class DataDomeHandler:
             return None
         json_url = _DD_JSON_URL.search(s.html.replace("\\/", "/")) if html_has_host and not dd else None
         if json_url:
-            kind = dd_frame_kind(json_url.group(1)) or "challenge"
+            kind = cast(Kind, dd_frame_kind(json_url.group(1)) or "challenge")
             return found(kind, "dd.json", challenge_url=json_url.group(1))
         rt = (dd or {}).get("rt", "")
         if rt == "i" or s.has("ct.captcha-delivery.com/i.js", "captcha-delivery.com/interstitial/"):
@@ -416,17 +424,21 @@ class DataDomeHandler:
                 log.debug("DataDome: the page was not hardened before navigation; the device check sees headless")
         tracker = DocumentTracker(page)
         try:
-            return await self._wait(page, deadline, solver, log, tracker)
+            return await self._wait(page, det, deadline, solver, log, tracker)
         finally:
             tracker.detach()
 
     # -- the wait ---------------------------------------------------------------------------------------------------
 
     async def _wait(
-        self, page: Any, deadline: float, solver: Optional["SolverRouter"], log: Any, tracker: Any
+        self, page: Any, det: Detection, deadline: float, solver: Optional["SolverRouter"], log: Any, tracker: Any
     ) -> SolveResult:
         cookies = await site_cookies(page, deadline, cap=2.0)
-        run = _Run(monotonic(), cookies.get(DD_COOKIE))
+        if det.signal is not None:
+            marked = dd_challenge_markers(det.signal.html)
+        else:
+            marked = dd_challenge_markers(await self._html(page, deadline) or "")
+        run = _Run(monotonic(), cookies.get(DD_COOKIE), marked)
         documents = tracker.count
         while monotonic() < deadline:
             if self._banned(page):
@@ -467,7 +479,9 @@ class DataDomeHandler:
                     dd = parse_dd_object(html) if "dd" in html else None
                     if (dd or {}).get("t") == "bv":
                         return SolveResult(False, "ban", used_solver=run.used_solver)
-                    if not dd_challenge_markers(html) and self._challenge_frame(page) is None:
+                    gone = not dd_challenge_markers(html) and self._challenge_frame(page) is None
+                    # Without a verdict in the DOM to begin with, only a new document shows the page moved on.
+                    if gone and (run.marked or tracker.count > documents):
                         log.info("DataDome: challenge gone from the page")
                         await self._loaded(page, deadline)
                         return SolveResult(True, "solved", [DD_COOKIE] if value else [], run.used_solver)
@@ -578,11 +592,13 @@ class DataDomeHandler:
             if waited > 6.0:
                 return SolveResult(False, "captcha", used_solver=run.used_solver)
             return None
-        if solver is None:
-            log.info("DataDome: slider captcha and no solver configured")
-            return SolveResult(False, "slider")
+        if solver is None and not widget.get("simple"):
+            log.info("DataDome: jigsaw slider and no solver configured")
+            return SolveResult(False, "slider", solver_kind=self.slider_kind)
         if run.slider_attempts >= self.max_slider_attempts:
-            return SolveResult(False, "slider_failed", used_solver=run.used_solver)
+            return SolveResult(
+                False, "slider_failed", used_solver=run.used_solver, solver_kind=self._solver_kind(widget)
+            )
         run.slider_attempts += 1
         result = await self._slide(page, frame, run, deadline, solver, log)
         if result is not None:
@@ -643,38 +659,50 @@ class DataDomeHandler:
         await bounded(page.mouse.up(), deadline, None, cap=2.0)
         return True
 
+    def _solver_kind(self, widget: Any) -> Optional[str]:
+        """The solver kind that would help with ``widget``: the jigsaw needs recognition, the simple slider none."""
+        return None if isinstance(widget, dict) and widget.get("simple") else self.slider_kind
+
     async def _slide(
-        self, page: Any, frame: Any, run: _Run, deadline: float, solver: "SolverRouter", log: Any
+        self, page: Any, frame: Any, run: _Run, deadline: float, solver: Optional["SolverRouter"], log: Any
     ) -> Optional[SolveResult]:
         """One slider attempt, then ``None`` (the caller waits for DataDome's verdict) or a final result.
 
         DataDome serves two sliders. The jigsaw (``SliderCaptcha``) needs the gap's position, which comes from the
         solver's recognition task; the "simple" slide-to-target variant (``#captcha__frame.simple``, puzzle canvases
-        never drawn) shows its target in the page, so no recognition is paid for. Either way the drag is closed-loop:
+        never drawn) shows its target in the page, so it needs no solver at all. Either way the drag is closed-loop:
         while the button is held, the handler reads where the piece (or handle) really is and corrects.
         """
         widget: Any = None
         started = monotonic()
         ready_by = min(deadline, started + 5.0)
+        images = "true" if solver is not None else "false"  # the puzzle images are only read for a solver
         while monotonic() < ready_by:
-            widget = await self._read(page, frame, _WIDGET_JS.replace("__IMAGES__", "true"), deadline, cap=4.0)
+            widget = await self._read(page, frame, _WIDGET_JS.replace("__IMAGES__", images), deadline, cap=4.0)
             if isinstance(widget, dict):
-                if widget.get("ready") and widget.get("pieceImage"):
+                if widget.get("ready") and (widget.get("pieceImage") or solver is None):
                     break
                 if widget.get("simple") and widget.get("target") and monotonic() - started > 1.5:
                     break
             await sleep_until(ready_by, 0.3)
+        unreadable = SolveResult(
+            False, "slider_unreadable", used_solver=run.used_solver, solver_kind=self._solver_kind(widget)
+        )
         if not isinstance(widget, dict) or not widget.get("handle"):
-            return SolveResult(False, "slider_unreadable", used_solver=run.used_solver)
+            return unreadable
         origin = await self._frame_origin(page, frame, deadline)
         if origin is None:
-            return SolveResult(False, "slider_unreadable", used_solver=run.used_solver)
-        if widget.get("ready") and widget.get("pieceImage"):
+            return unreadable
+        if widget.get("simple") and widget.get("target") and widget.get("track"):
+            plan = self._target_plan(widget)
+        elif widget.get("ready") and solver is None:
+            return SolveResult(False, "slider", solver_kind=self.slider_kind)
+        elif widget.get("ready") and widget.get("pieceImage") and solver is not None:
             plan = await self._puzzle_plan(page, widget, run, deadline, solver, log)
         elif widget.get("target") and widget.get("track"):
             plan = self._target_plan(widget)
         else:
-            return SolveResult(False, "slider_unreadable", used_solver=run.used_solver)
+            return unreadable
         if isinstance(plan, SolveResult):
             return plan
         goal, start_value, ratio, read_js = plan
@@ -694,28 +722,28 @@ class DataDomeHandler:
         piece_png = _data_url_bytes(widget.get("pieceImage"))
         background_png = _data_url_bytes(widget.get("backgroundImage"))
         background, cut = widget.get("background"), widget.get("pieceCut")
+        kind = self.slider_kind
         if not (piece_png and background_png and background and cut and widget.get("backgroundWidth")):
-            return SolveResult(False, "slider_unreadable", used_solver=run.used_solver)
+            return SolveResult(False, "slider_unreadable", used_solver=run.used_solver, solver_kind=kind)
         if deadline - monotonic() < 3.0:
-            return SolveResult(False, "timeout", used_solver=run.used_solver)
+            return SolveResult(False, "timeout", used_solver=run.used_solver, solver_kind=kind)
         try:
-            answer = await solver.recognize(
-                self.slider_kind, [piece_png, background_png], page_url=page.url, deadline=deadline
-            )
+            # Only the two puzzle images leave the machine (no page URL).
+            answer = await solver.recognize(kind, [piece_png, background_png], deadline=deadline)
         except SolverError as error:
             code = error.code or type(error).__name__
             log.warning(f"DataDome: slider recognition failed ({code})")
             if code in ("EXPERIMENTAL", "NO_PROVIDER", "KIND_UNSUPPORTED"):
-                return SolveResult(False, "slider", used_solver=run.used_solver)
-            return SolveResult(False, f"solver_error:{code}", used_solver=run.used_solver)
+                return SolveResult(False, "slider", used_solver=run.used_solver, solver_kind=kind)
+            return SolveResult(False, f"solver_error:{code}", used_solver=run.used_solver, solver_kind=kind)
         except Exception as error:  # a misbehaving third-party solver
             log.warning(f"DataDome: slider recognition crashed ({type(error).__name__})")
-            return SolveResult(False, "solver_error:crash", used_solver=run.used_solver)
+            return SolveResult(False, "solver_error:crash", used_solver=run.used_solver, solver_kind=kind)
         run.used_solver = (answer or {}).get("provider") or getattr(solver, "name", None) or run.used_solver
         try:
             distance = float(answer["distance"])
         except (KeyError, TypeError, ValueError):
-            return SolveResult(False, "solver_error:no_distance", used_solver=run.used_solver)
+            return SolveResult(False, "solver_error:no_distance", used_solver=run.used_solver, solver_kind=kind)
         # The solver answers in background-image pixels; the canvases may be drawn at another CSS size. The piece
         # sits ``cut.x`` image pixels inside its layer, and the layer is what moves.
         scale = background["w"] / float(widget["backgroundWidth"])

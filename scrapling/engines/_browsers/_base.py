@@ -572,9 +572,10 @@ class StealthySessionMixin(BaseSessionMixin):
         """The options the browser is launched with.
 
         With `solve_antibot` on a headless launch, the launch switches that make headless Chrome stand out (the window
-        pinned at the screen origin, a forced sRGB profile, hidden scrollbars) are replaced by the host's real screen,
-        window size and colour profile (see `scrapling.engines.antibot.headless.launch_args`). This happens here, at
-        launch, so it also applies after callers edited the session's launch options.
+        pinned at the screen origin, a forced sRGB profile, hidden scrollbars) are replaced by an ordinary desktop
+        screen, window size and colour profile (one common display by default, see
+        `scrapling.engines.antibot.headless.launch_args` and `set_display_policy`). This happens here, at launch, so it
+        also applies after callers edited the session's launch options.
         """
         options = dict(self._browser_options)
         if self._antibot_hardened_launch() and options.get("args") is not None:

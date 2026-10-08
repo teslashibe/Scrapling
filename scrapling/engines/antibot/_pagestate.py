@@ -173,24 +173,47 @@ class DocumentTracker:
 class Recheck:
     """Re-runs a handler's ``detect`` on the live page while its solver waits.
 
-    The response of the original navigation is never reused (the page may have reloaded since): only a document
-    that arrived during the solve lends its status and headers to the re-check, through a :class:`DocumentTracker`.
-    A page in the middle of its own reload can read as clean for an instant, so "cleared" takes two clean reads.
+    Until a new main-frame document arrives the page is still the document that was detected, so the re-check uses
+    the detection's own status and headers (:attr:`Detection.signal`): a block page that never changed keeps
+    reading as a block, whatever its DOM says. Once a document arrives during the solve, its status and headers
+    (through a :class:`DocumentTracker`) replace them. A page in the middle of its own reload can read as clean for
+    an instant, so "cleared" takes two clean reads.
+
+    :param status: The detected document's status, when the detection carries no signal.
+    :param headers: The detected document's headers, when the detection carries no signal.
     """
 
-    def __init__(self, handler: Any, page: Any, det: "Detection") -> None:
+    def __init__(
+        self,
+        handler: Any,
+        page: Any,
+        det: "Detection",
+        *,
+        status: Optional[int] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> None:
         self.handler = handler
         self.page = page
         self.det = det
+        origin = getattr(det, "signal", None)
+        self.origin_status: Optional[int] = origin.status if origin is not None else status
+        self.origin_headers: Dict[str, str] = dict(origin.headers if origin is not None else headers or {})
         self.tracker = DocumentTracker(page)
+
+    @property
+    def reloaded(self) -> bool:
+        """True once a new main-frame document arrived during the solve."""
+        return self.tracker.count > 0
 
     def detach(self) -> None:
         self.tracker.detach()
 
     async def read(self, stop: float) -> Optional[Tuple["Signal", Optional["Detection"]]]:
         """``(signal, detection)`` for the page as it is now; ``None`` while it cannot be read or is still empty."""
-        status = self.tracker.status if self.tracker.count else None
-        headers = self.tracker.headers if self.tracker.count else {}
+        if self.tracker.count:
+            status, headers = self.tracker.status, self.tracker.headers
+        else:
+            status, headers = self.origin_status, self.origin_headers
         signal = await bounded(page_signal(self.page, status=status, headers=headers), stop, None, 5.0)
         if signal is None or looks_empty(signal.html):
             return None

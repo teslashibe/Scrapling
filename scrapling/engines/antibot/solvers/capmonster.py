@@ -22,7 +22,7 @@ CapMonster does not report per-task cost, so costs are estimated from the public
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from scrapling.core._types import Any, Dict, List, Optional, Tuple
 
 from ._client import CreateTaskSolver, ProxySpec, parse_grid, put, recaptcha_label_id, recaptcha_label_text
 from .base import (
@@ -89,6 +89,7 @@ class CapMonsterSolver(CreateTaskSolver):
     }
     cooldown_codes = {"ERROR_TOO_MUCH_REQUESTS": 30.0}
     # USD per 1,000 (https://capmonster.cloud/en/prices, 2026-10-07). reCAPTCHA grid images are $0.04 per 1,000 images.
+    # hCaptcha is not on the price page: 3.00 is a deliberately high estimate so spend caps still bound it.
     default_prices = {
         "turnstile": 1.30,
         "turnstile_challenge": 1.30,
@@ -99,6 +100,7 @@ class CapMonsterSolver(CreateTaskSolver):
         "geetest_v3": 1.20,
         "geetest_v4": 1.20,
         "awswaf": 1.40,
+        "hcaptcha": 3.00,
         "recaptcha_grid": 0.04,
         "image_text": 0.30,
     }

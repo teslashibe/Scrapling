@@ -330,7 +330,7 @@ async def find_widget_frame(page: Any) -> Optional[Any]:
             button = frame.locator('[role="button"]')
             if await button.count() and _visible(await button.first.bounding_box(timeout=500)):
                 return frame
-        except Exception:
+        except Exception:  # nosec B112 - a decoy or detached frame: try the next one
             continue
     return None
 

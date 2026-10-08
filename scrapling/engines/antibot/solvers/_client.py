@@ -26,8 +26,9 @@ import ssl
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Awaitable, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple, Type, Union
 from urllib.parse import urlsplit, unquote
+
+from scrapling.core._types import Any, Awaitable, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple, Type, Union
 
 from scrapling.core.utils import log
 
@@ -44,6 +45,7 @@ from .base import (
     SolverUnsolvable,
     SolverUnsupported,
     Token,
+    provider_url,
     redact,
 )
 
@@ -307,6 +309,8 @@ class CreateTaskSolver:
         timeout, deadline, proxy, o = self._split_options(extra, TOKEN_OPTIONS, self.timeout)
         if not sitekey and kind not in ("awswaf", "awswaf_voucher"):
             raise SolverBadRequest("a sitekey is required", provider=self.name, code="NO_SITEKEY", fallback=False)
+        # The provider learns the page's host and path only: never its query string, fragment or credentials.
+        page_url = provider_url(page_url)
         if not page_url:
             raise SolverBadRequest("page_url is required", provider=self.name, code="NO_PAGE_URL", fallback=False)
         task = self.build_token_task(kind, sitekey, page_url, o)
@@ -320,7 +324,9 @@ class CreateTaskSolver:
             value, user_agent = "", None
         if not value or not isinstance(value, str):
             self._record(kind, task, False, task_id, "EMPTY_SOLUTION", started, response)
-            raise SolverUnavailable("the solution has no token", provider=self.name, code="EMPTY_SOLUTION")
+            raise SolverUnavailable(
+                "the solution has no token", provider=self.name, code="EMPTY_SOLUTION", task_created=True
+            )
         cost, source = self._record(kind, task, True, task_id, None, started, response)
         elapsed = time.monotonic() - started
         log.debug(f"{self.name}: {kind} token ready in {elapsed:.1f}s (task {task_id})")
@@ -344,6 +350,10 @@ class CreateTaskSolver:
                 "images must be a non-empty list", provider=self.name, code="NO_IMAGES", fallback=False
             )
         timeout, deadline, proxy, o = self._split_options(extra, RECOGNITION_OPTIONS, self.default_recognition_timeout)
+        if o.get("page_url"):
+            o["page_url"] = provider_url(o["page_url"]) or None
+            if o["page_url"] is None:
+                del o["page_url"]
         if proxy is not None:
             raise SolverBadRequest(
                 "recognition tasks never take a proxy", provider=self.name, code="PROXY", fallback=False
@@ -360,7 +370,7 @@ class CreateTaskSolver:
         except (KeyError, TypeError, ValueError):
             self._record(kind, task, False, task_id, "BAD_SOLUTION", started, response, units=len(encoded))
             raise SolverUnavailable(
-                "unexpected recognition solution", provider=self.name, code="BAD_SOLUTION"
+                "unexpected recognition solution", provider=self.name, code="BAD_SOLUTION", task_created=True
             ) from None
         cost, source = self._record(kind, task, True, task_id, None, started, response, units=len(encoded))
         elapsed = time.monotonic() - started
@@ -396,7 +406,9 @@ class CreateTaskSolver:
         if extra.get("deadline") is not None:
             deadline = min(deadline, float(extra["deadline"]))
         if deadline <= time.monotonic():
-            raise SolverTimeout("no time left before the deadline", provider=self.name, code="DEADLINE")
+            raise SolverTimeout(
+                "no time left before the deadline", provider=self.name, code="DEADLINE", task_created=False
+            )
         return timeout, deadline, extra.get("proxy"), o
 
     def _maybe_proxy(self, kind: str, task: Dict[str, Any], proxy: Any) -> Dict[str, Any]:
@@ -496,6 +508,8 @@ class CreateTaskSolver:
                     raise SolverTimeout("poll limit reached", provider=self.name, code="POLL_LIMIT")
                 await _sleep_until(interval, deadline)
         except SolverError as e:
+            # The router books spend by this: a task the provider accepted may still be billed.
+            e.task_created = task_id is not None
             self._record(kind, task, False, task_id, e.code or type(e).__name__, started, None, units=units)
             raise
 

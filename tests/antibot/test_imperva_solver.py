@@ -149,6 +149,7 @@ class TestIncident:
         page, incident = incident_page()
         result, _ = await solve(page, detect(INCIDENT, frames=[f.url for f in page.child_frames]))
         assert not result.solved and result.reason == "captcha_required:hcaptcha"
+        assert result.solver_kind == "hcaptcha"
         assert len(page.mouse.downs) == 1 and page.mouse.ups == 1
         x, y = page.mouse.downs[0]
         assert 400 + 27 <= x <= 400 + 33 and 300 + 33 <= y <= 300 + 39
@@ -201,6 +202,7 @@ class TestIncident:
         page.child_frames = [FakeFrame(INCIDENT_FRAME_URL, GEETEST_FRAME_HTML)]
         result, _ = await solve(page, detect(INCIDENT), solver=FakeSolver(("geetest_v3", "geetest_v4")))
         assert result.reason == "captcha_required:geetest" and page.mouse.downs == []
+        assert result.solver_kind is None  # no solver route for Imperva's GeeTest
 
     @pytest.mark.asyncio
     async def test_geetest_click_to_verify_gets_one_click(self):
@@ -219,3 +221,41 @@ class TestIncident:
         assert result.solved and result.reason == "solved:checkbox"
         x, y = page.mouse.downs[0]
         assert 500 + 147 <= x <= 500 + 153 and 200 + 19 <= y <= 200 + 25
+
+
+BLOCK = (
+    "<html><head><title>Access denied</title><style>" + "body{margin:0;padding:0}" * 300 + "</style></head>"
+    "<body><h1>Access denied</h1><p>Error 15. This request was blocked by our security service. "
+    "Incapsula incident ID: 123000450123456789-12345</p></body></html>"
+)
+
+
+class TestBlock:
+    """A block page has no sensor that clears it in place: an unchanged one is never reported solved."""
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_block_page_is_blocked(self, monkeypatch):
+        monkeypatch.setattr(solver_module, "BLOCK_PATIENCE", 1.0)
+        det = detect(BLOCK, status=403, headers={"x-iinfo": "1-2-3", "x-cdn": "Imperva"})
+        assert det is not None and (det.kind, det.rule) == ("block", "imperva.block")
+        page = FakePage(URL, BLOCK)
+        result, elapsed = await solve(page, det)
+        assert (result.solved, result.reason) == (False, "blocked") and elapsed < 2.5
+        assert result.solver_kind is None
+
+    @pytest.mark.asyncio
+    async def test_a_block_whose_status_is_unknown_still_needs_a_new_document(self, monkeypatch):
+        """Without the detected status the page reads clean; only a reload into content counts."""
+        monkeypatch.setattr(solver_module, "BLOCK_PATIENCE", 1.0)
+        det = detect(BLOCK, status=403)
+        det.signal = None  # a caller-built detection: the re-check has no status to go on
+        result, _ = await solve(FakePage(URL, BLOCK), det)
+        assert (result.solved, result.reason) == (False, "blocked")
+
+    @pytest.mark.asyncio
+    async def test_a_block_that_reloads_into_content_is_solved(self, monkeypatch):
+        monkeypatch.setattr(solver_module, "BLOCK_PATIENCE", 3.0)
+        page = FakePage(URL, BLOCK)
+        page.at(0.3, lambda p: p.navigate(CONTENT))
+        result, _ = await solve(page, detect(BLOCK, status=403))
+        assert (result.solved, result.reason) == (True, "solved")

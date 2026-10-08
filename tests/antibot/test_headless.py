@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+from scrapling.engines.antibot import headless
 from scrapling.engines.antibot.headless import (
     DROP_ARGS,
     MAC_TOOLBAR_HEIGHT,
@@ -63,8 +64,6 @@ class TestBrands:
 
 class TestIdentity:
     def test_from_browser_version_on_apple_silicon(self, monkeypatch):
-        import scrapling.engines.antibot.headless as headless
-
         monkeypatch.setattr(headless._platform, "mac_ver", lambda: ("26.6.2", ("", "", ""), "arm64"))
         identity = Identity.from_version(
             {"product": "Chrome/155.0.8059.39", "userAgent": HEADLESS_UA},
@@ -146,6 +145,37 @@ class TestDisplays:
             {"viewport": {"width": 1, "height": 1}, "screen": {}, "device_scale_factor": 2, "locale": "en-US"}
         )
         assert options == {"locale": "en-US", "no_viewport": True}
+
+
+class TestDisplayPolicy:
+    """By default the browser describes one common display, never the machine's own monitors."""
+
+    @pytest.fixture(autouse=True)
+    def restore(self):
+        yield
+        headless.set_display_policy("canonical")
+
+    def test_canonical_by_default_and_the_host_is_never_read(self, monkeypatch):
+        def boom(*_a, **_k):  # pragma: no cover - would mean the host's displays were read
+            raise AssertionError("host displays read")
+
+        monkeypatch.setattr(headless, "host_displays", boom)
+        assert headless.display_policy() == "canonical"
+        assert headless.session_displays("darwin") == (headless.DEFAULT_MAC_DISPLAY,)
+        assert headless.session_displays("linux") == (headless.DEFAULT_DISPLAY,)
+        args = launch_args(["--keep-me"], host="darwin")
+        assert headless.DEFAULT_MAC_DISPLAY.screen_info_switch() in args
+
+    def test_host_policy_describes_every_host_display(self, monkeypatch):
+        main, second = Display(3200, 1800, scale=2, inset_top=30), Display(2880, 1620, scale=2, left=-2880)
+        monkeypatch.setattr(headless, "host_displays", lambda refresh=False: (main, second))
+        headless.set_display_policy("host")
+        assert headless.session_displays("darwin") == (main, second)
+        assert main.screen_info_switch() in launch_args([], host="darwin")
+
+    def test_unknown_policy_is_refused(self):
+        with pytest.raises(ValueError):
+            headless.set_display_policy("all")
 
 
 # -- A real headless browser: the top page and a cross-site (out-of-process) iframe must agree ----------------------
@@ -238,7 +268,8 @@ class TestEveryFrameAgrees:
         assert "HeadlessChrome" not in top["ua"] and "Google Chrome" in top["brands"]
         assert top["outer"][1] > top["inner"][1] + 1  # a toolbar above the page
         if no_viewport:
-            assert top["screen"][4] == hardening.displays[0].inset_top  # the real menu bar
+            assert hardening.displays == headless.canonical_displays()  # one common display, not the host's
+            assert top["screen"][4] == hardening.displays[0].inset_top  # its menu bar
             assert top["pos"][0] > 0  # not pinned to the screen origin
         if sys.platform == "darwin" and __import__("platform").machine() == "arm64":
             assert top["arch"] == "arm"

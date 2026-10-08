@@ -91,12 +91,27 @@ class TestChallenge:
         assert not result.solved and page.reloads == 0 and elapsed < 1.7
 
     @pytest.mark.asyncio
-    async def test_header_only_detection_on_an_already_reloaded_page_is_solved_at_once(self):
-        """The integrator may build the signal from the first (202) response after the page already reloaded."""
+    async def test_a_header_only_detection_needs_a_new_document(self):
+        """Until a new document arrives the page is still the 202 challenge it was detected as, whatever its DOM."""
         page = FakePage(URL, CONTENT)
         page.context.store["aws-waf-token"] = "tok"
-        result, elapsed = await solve(page, detect(CHALLENGE, 202, "challenge"))
-        assert result.solved and elapsed < 1.5
+        result, elapsed = await solve(page, detect(CONTENT, 202, "challenge"), timeout=1.2)
+        assert not result.solved and result.reason == "timeout" and elapsed < 1.7
+        page = FakePage(URL, CONTENT)
+        page.at(0.3, lambda p: p.navigate(CONTENT))
+        result, _ = await solve(page, detect(CONTENT, 202, "challenge"))
+        assert result.solved
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_token_status_page_is_a_block(self, monkeypatch):
+        monkeypatch.setattr(solver_module, "TOKEN_STATUS_PATIENCE", 0.6)
+        gate = "<html><body><h1>Forbidden</h1></body></html>"
+        det = AwsWafHandler().detect(Signal(url=URL, status=403, cookies={"aws-waf-token": "tok"}, html=gate))
+        assert det is not None and det.rule == "aws.token_status"
+        page = FakePage(URL, gate)
+        page.context.store["aws-waf-token"] = "tok"
+        result, elapsed = await solve(page, det)
+        assert (result.solved, result.reason) == (False, "blocked") and elapsed < 2.0
 
     @pytest.mark.asyncio
     async def test_escalation_to_captcha_without_a_solver(self):
@@ -104,6 +119,7 @@ class TestChallenge:
         page.at(0.2, lambda p: p.navigate(CAPTCHA, 405, {"x-amzn-waf-action": "captcha"}))
         result, _ = await solve(page, detect(CHALLENGE, 202, "challenge"))
         assert not result.solved and result.reason == "captcha_required"
+        assert result.solver_kind == "awswaf"
 
 
 class TestCaptcha:
@@ -122,7 +138,8 @@ class TestCaptcha:
         assert result.solved and result.reason == "solved:awswaf"
         assert result.used_solver == "fakeprov"
         kind, sitekey, page_url, extra = solver.calls[0]
-        assert (kind, sitekey, page_url) == ("awswaf", GOKU["key"], URL)
+        # The provider is told the page's host and path, never its query string.
+        assert (kind, sitekey, page_url) == ("awswaf", GOKU["key"], "https://www.example.com/find/")
         assert extra["aws_iv"] == GOKU["iv"] and extra["aws_context"] == GOKU["context"]
         assert extra["aws_challenge_script"] == f"{TOKEN_HOST}/challenge.js"
         assert extra["aws_captcha_script"] == f"{CAPTCHA_HOST}/captcha.js"

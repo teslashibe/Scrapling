@@ -24,6 +24,14 @@ Safety rails:
 * **Caps.** ``max_solves_per_fetch`` (default 2) bounds how many challenges one fetch may pay for,
   ``max_attempts_per_solve`` bounds provider fallbacks, and optional USD caps bound spend per fetch and in total.
   Call :meth:`SolverRouter.scope` once per fetch to get fresh per-fetch counters that share the ledger.
+* **Spend is booked when a task is sent**, at the provider's estimated price, not when an answer comes back: a task
+  abandoned at the deadline, cancelled with its caller or lost to network errors may still be billed, so it still
+  counts against the caps. It is refunded only for failures providers do not bill (a refused task, an unsolvable
+  challenge, no free worker; :data:`~.base.FREE_FAILURES`), and replaced by the provider's own figure when it
+  reports one. A provider that fails after accepting a task is not followed by another provider for that challenge.
+  With a USD cap set, a provider that has no price for a kind is not used for it.
+* **Page URLs** reach providers as ``scheme://host/path`` only (:func:`~.base.provider_url`): no query string,
+  fragment or credentials. Recognition tasks send only images and the question.
 * **Deadlines.** Every call takes ``deadline`` (a ``time.monotonic()`` value) and never runs past it.
 * **Cooldowns.** A provider that reports a bad key, an empty balance or throttling is skipped for a while.
 * **Experimental kinds** (Turnstile challenge-page tokens, DataDome sliders) are refused unless ``experimental=True``.
@@ -31,8 +39,10 @@ Safety rails:
 
 from __future__ import annotations
 
+import asyncio
 import time
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+
+from scrapling.core._types import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from scrapling.core.utils import log as _default_log
 
@@ -40,6 +50,7 @@ from ._client import CONTROL_OPTIONS, RECOGNITION_OPTIONS, TOKEN_OPTIONS
 from .base import (
     ALL_KINDS,
     EXPERIMENTAL_KINDS,
+    FREE_FAILURES,
     RECOGNITION_KINDS,
     TOKEN_KINDS,
     SolveRecord,
@@ -51,7 +62,9 @@ from .base import (
     SolverProxyNotAllowed,
     SolverTimeout,
     SolverUnavailable,
+    SolverUnsolvable,
     SolverUnsupported,
+    provider_url,
 )
 
 __all__ = ["SolverRouter", "DEFAULT_ROUTES", "PROVIDER_NAMES"]
@@ -174,6 +187,7 @@ class SolverRouter:
         self.experimental = bool(experimental)
         self.min_attempt_s = None if min_attempt_s is None else float(min_attempt_s)
         self._log = log or _default_log
+        self._is_scope = _shared is not None and not solvers
         self._solves = 0
         self._attempts = 0
         self._spent_usd = 0.0
@@ -254,6 +268,11 @@ class SolverRouter:
             log=log,
         )
 
+    @property
+    def is_scope(self) -> bool:
+        """True for a router made by :meth:`scope` (per-fetch counters over a shared ledger)."""
+        return self._is_scope
+
     def scope(self) -> "SolverRouter":
         """Return a router with fresh per-fetch counters that shares providers, cooldowns and the total ledger."""
         return SolverRouter(
@@ -323,6 +342,11 @@ class SolverRouter:
     def solves_used(self) -> int:
         return self._solves
 
+    @property
+    def attempts(self) -> int:
+        """Provider attempts made through this scope (each one may have been billed)."""
+        return self._attempts
+
     def summary(self) -> Dict[str, Any]:
         """A JSON-safe summary of this scope's activity (no keys, tokens or proxies)."""
         return {
@@ -348,6 +372,8 @@ class SolverRouter:
     async def solve_token(self, kind: str, sitekey: str, page_url: str, **extra: Any) -> str:
         if kind not in TOKEN_KINDS:
             raise SolverUnsupported(f"{kind!r} is not a token kind", provider=self.name, code="KIND_UNSUPPORTED")
+        # Providers learn the page's host and path only (no query string, fragment or credentials).
+        page_url = provider_url(page_url) or page_url
         return await self._dispatch(
             kind, extra, TOKEN_OPTIONS, lambda s, kw: s.solve_token(kind, sitekey, page_url, **kw)
         )
@@ -357,9 +383,17 @@ class SolverRouter:
             raise SolverUnsupported(f"{kind!r} is not a recognition kind", provider=self.name, code="KIND_UNSUPPORTED")
         if extra.get("proxy") not in (None, ""):
             raise SolverProxyNotAllowed("recognition tasks never take a proxy", provider=self.name, code="PROXY")
-        return await self._dispatch(kind, extra, RECOGNITION_OPTIONS, lambda s, kw: s.recognize(kind, images, **kw))
+        if extra.get("page_url"):
+            extra["page_url"] = provider_url(extra["page_url"]) or None
+        return await self._dispatch(
+            kind,
+            extra,
+            RECOGNITION_OPTIONS,
+            lambda s, kw: s.recognize(kind, images, **kw),
+            units=len(images) if isinstance(images, (list, tuple)) else 1,
+        )
 
-    async def _dispatch(self, kind: str, extra: Dict[str, Any], allowed: frozenset, call) -> Any:
+    async def _dispatch(self, kind: str, extra: Dict[str, Any], allowed: frozenset, call, units: int = 1) -> Any:
         unknown = sorted(set(extra) - allowed - CONTROL_OPTIONS)
         if unknown:
             raise SolverBadRequest(
@@ -396,7 +430,13 @@ class SolverRouter:
             if self._shared.cooldown_until.get(name, 0.0) > time.monotonic():
                 continue  # cooled down by a concurrent call
             solver = self._shared.solvers[name]
-            estimate = _price(solver, kind)
+            estimate = _price(solver, kind, units)
+            if estimate is None:
+                if self._capped:
+                    # Without a price the spend caps cannot bound this provider for this kind.
+                    errors.append(SolverBudgetExceeded("no price with a spend cap", provider=name, code="NO_PRICE"))
+                    continue
+                estimate = 0.0
             if not self._within_budget(estimate):
                 errors.append(SolverBudgetExceeded("spend cap reached", provider=name, code="MAX_COST"))
                 continue
@@ -414,9 +454,14 @@ class SolverRouter:
             attempts += 1
             self._attempts += 1
             started = time.monotonic()
+            # Booked before the call: a task cancelled or abandoned on the way may still be billed.
+            self._charge(estimate)
             try:
                 result = await call(solver, dict(extra, deadline=deadline))
             except SolverError as e:
+                billed = _billed(e)
+                if not billed:
+                    self._charge(-estimate)
                 self._note(
                     SolveRecord(
                         provider=name,
@@ -424,6 +469,8 @@ class SolverRouter:
                         task_type="",
                         ok=False,
                         error_code=e.code or type(e).__name__,
+                        cost_usd=round(estimate, 6) if billed and estimate else None,
+                        cost_source="estimated" if billed and estimate else None,
                         elapsed_s=round(time.monotonic() - started, 3),
                     )
                 )
@@ -431,9 +478,25 @@ class SolverRouter:
                     self._shared.cooldown_until[name] = time.monotonic() + float(e.cooldown_s)
                 self._log.warning(f"captcha solver: {kind} via {name} failed ({e.code or type(e).__name__})")
                 errors.append(e)
-                if not e.fallback:
+                # A provider that took the task and then failed may still bill it: do not pay a second one.
+                if not e.fallback or (e.task_created and isinstance(e, (SolverUnavailable, SolverTimeout))):
                     raise
                 continue
+            except asyncio.CancelledError:
+                # The caller gave up (its deadline): the task may still finish and be billed, so the estimate stays.
+                self._note(
+                    SolveRecord(
+                        provider=name,
+                        kind=kind,
+                        task_type="",
+                        ok=False,
+                        error_code="CANCELLED",
+                        cost_usd=round(estimate, 6) if estimate else None,
+                        cost_source="estimated" if estimate else None,
+                        elapsed_s=round(time.monotonic() - started, 3),
+                    )
+                )
+                raise
             except Exception as e:  # a third-party Solver implementation misbehaved
                 err = SolverUnavailable(f"{type(e).__name__}", provider=name, code="SOLVER_CRASH")
                 self._note(
@@ -443,6 +506,8 @@ class SolverRouter:
                         task_type="",
                         ok=False,
                         error_code=err.code,
+                        cost_usd=round(estimate, 6) if estimate else None,
+                        cost_source="estimated" if estimate else None,
                         elapsed_s=round(time.monotonic() - started, 3),
                     )
                 )
@@ -450,6 +515,10 @@ class SolverRouter:
                 errors.append(err)
                 continue
             cost, source = _result_cost(result)
+            if cost is not None:
+                self._charge(cost - estimate)  # the provider's (or the client's) own figure replaces the estimate
+            elif estimate:
+                cost, source = round(estimate, 6), "estimated"
             self._note(
                 SolveRecord(
                     provider=name,
@@ -476,6 +545,16 @@ class SolverRouter:
         failure.errors = errors  # type: ignore[attr-defined]
         raise failure
 
+    @property
+    def _capped(self) -> bool:
+        return self.max_cost_usd_per_fetch is not None or self.max_cost_usd_total is not None
+
+    def _charge(self, amount: float) -> None:
+        """Book ``amount`` USD (negative to refund) on this scope and on the shared ledger."""
+        if amount:
+            self._spent_usd = max(0.0, self._spent_usd + amount)
+            self._shared.spent_usd = max(0.0, self._shared.spent_usd + amount)
+
     def _within_budget(self, estimate: float) -> bool:
         if self.max_cost_usd_per_fetch is not None and self._spent_usd + estimate > self.max_cost_usd_per_fetch + 1e-12:
             return False
@@ -486,9 +565,6 @@ class SolverRouter:
     def _note(self, record: SolveRecord) -> None:
         self._records.append(record)
         self._shared.records.append(record)
-        if record.cost_usd:
-            self._spent_usd += record.cost_usd
-            self._shared.spent_usd += record.cost_usd
 
 
 def _supports(solver: Solver, kind: str) -> bool:
@@ -498,12 +574,26 @@ def _supports(solver: Solver, kind: str) -> bool:
         return False
 
 
-def _price(solver: Any, kind: str) -> float:
+def _price(solver: Any, kind: str, units: int = 1) -> Optional[float]:
+    """Estimated USD for one ``kind`` task at ``solver`` (``units`` images for per-image kinds), or ``None``."""
     prices = getattr(solver, "prices", None) or {}
+    if kind not in prices:
+        return None
     try:
-        return float(prices.get(kind, 0.0)) / 1000.0
+        per_task = float(prices[kind]) / 1000.0
     except (TypeError, ValueError):  # pragma: no cover
-        return 0.0
+        return None
+    per_image = kind in (getattr(solver, "per_image_kinds", None) or ())
+    return per_task * max(1, int(units)) if per_image else per_task
+
+
+def _billed(error: SolverError) -> bool:
+    """Whether a failed attempt may still be billed by the provider (and so stays on the ledger)."""
+    if isinstance(error, SolverUnsolvable) or error.task_created is False:
+        return False
+    if error.task_created is True:
+        return True
+    return not isinstance(error, FREE_FAILURES)
 
 
 def _result_attr(result: Any, name: str) -> Any:

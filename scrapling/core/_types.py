@@ -30,6 +30,9 @@ from typing import (
     Protocol,
     Coroutine,
     SupportsIndex,
+    FrozenSet,
+    Type,
+    runtime_checkable,
 )
 from typing_extensions import Self, Unpack, TypedDict
 

@@ -64,7 +64,7 @@ class KasadaHandler:
             details["headers"] = kp_headers
 
         def found(rule: str) -> Detection:
-            return Detection(vendor=self.vendor, kind="challenge", rule=rule, details=details)
+            return Detection(vendor=self.vendor, kind="challenge", rule=rule, details=details, signal=s)
 
         if s.status_in(403, 429):
             if kp_headers:

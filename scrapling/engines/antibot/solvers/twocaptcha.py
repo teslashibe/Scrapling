@@ -26,7 +26,8 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Dict, List, Optional, Tuple
+
+from scrapling.core._types import Any, Dict, List, Optional, Tuple
 
 from ._client import CreateTaskSolver, ProxySpec, parse_grid, put, recaptcha_label_text
 from .base import (

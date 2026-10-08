@@ -7,6 +7,9 @@ What the page can be stuck on, and what :func:`solve_imperva` does:
   path (``...?d=<host>``), stores ``reese84``/``___utmvc`` and reloads. The solver waits for that while giving the
   sensor pointer input, reloads once if a cookie changed but no new document arrived, and reads ``renewInSec``
   from the token response when it sees one (``det.details['renew_in_sec']``).
+* **Block page** (``imperva.block``). It has no sensor to wait for: the solver gives Imperva's script a few seconds
+  to set a cookie and reload (reloading once itself if a cookie changed), and only a new document that no longer
+  reads as Imperva counts as cleared; otherwise the result is ``blocked``.
 * **Incident page** (``imperva.incident``: the ``_Incapsula_Resource?SWUDNSAI=`` iframe). When it carries an
   hCaptcha, the solver clicks the checkbox once (free; trusted browsers pass). If the page stays, and a solver
   router that supports ``hcaptcha`` was passed, it gets a token, posts it to Imperva's own
@@ -33,6 +36,7 @@ from scrapling.core._types import TYPE_CHECKING, Any, Dict, List, Optional, Set,
 from scrapling.engines.antibot._pagestate import Recheck, bounded, reload_page, site_cookies, solver_name, supports
 from scrapling.engines.antibot._pointer import human_path, move_along, sleep_until, viewport_size, wander
 from scrapling.engines.antibot.base import Detection, SolveResult, remaining
+from scrapling.engines.antibot.solvers.base import provider_url
 
 if TYPE_CHECKING:  # pragma: no cover
     from scrapling.engines.antibot.imperva import ImpervaHandler
@@ -184,7 +188,9 @@ class _Run:
 
     async def unsolved(self, reason: str, used_solver: Optional[str] = None) -> SolveResult:
         names = imperva_cookie_names(await site_cookies(self.page, self.deadline))
-        return SolveResult(solved=False, reason=reason, cookies=names, used_solver=used_solver)
+        # Only the hCaptcha incident has a solver route; GeeTest, a missing widget and blocks have none.
+        solver_kind = "hcaptcha" if reason.startswith("captcha_required:hcaptcha") else None
+        return SolveResult(solved=False, reason=reason, cookies=names, used_solver=used_solver, solver_kind=solver_kind)
 
     # ----------------------------------------------------------- the sensor
 
@@ -198,7 +204,10 @@ class _Run:
         next_wander = monotonic() + self.rng.uniform(0.3, 1.0)
         while remaining(stop) > 0.2:
             current_det = await self.clear_streak(stop)
-            if current_det is None:
+            if current_det is None and self.det.kind == "block" and not self.check.reloaded:
+                # A block page has no sensor that clears it in place: only a new document can be past it.
+                current_det = self.det
+            elif current_det is None:
                 return await self.cleared()
             if current_det.rule == "imperva.incident":
                 self._debug("Imperva escalated to its incident page")
@@ -362,7 +371,7 @@ class _Run:
         try:
             token = await wait_for(
                 self.solver.solve_token(
-                    "hcaptcha", widget.sitekey, self.page.url, deadline=self.deadline - SOLVER_MARGIN
+                    "hcaptcha", widget.sitekey, provider_url(self.page.url), deadline=self.deadline - SOLVER_MARGIN
                 ),
                 timeout=left,
             )

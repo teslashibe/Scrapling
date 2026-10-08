@@ -6,7 +6,7 @@
 |---|---|---|
 | Cloudflare | `cf-mitigated`, the `cType` challenge page, a Turnstile gate, error pages 1010/1015/1020 | Runs Scrapling's Cloudflare solver within the deadline. A Turnstile gate that a click does not clear can go to a captcha solver. |
 | AWS WAF | `x-amzn-waf-action`, `gokuProps`, `<awswaf-captcha>` | Waits for `challenge.js` to store `aws-waf-token`. The image CAPTCHA can go to a captcha solver (image recognition first, then a token). |
-| DataDome | The `var dd={...}` verdict, `x-dd-b`, `captcha-delivery.com` frames | Waits out the device check, clicks a shown confirm button once, stops on a ban (`t=bv`). The slider can go to a captcha solver. |
+| DataDome | The `var dd={...}` verdict, `x-dd-b`, `captcha-delivery.com` frames | Waits out the device check, clicks a shown confirm button once, stops on a ban (`t=bv`). Drags the slide-to-target slider onto its target by itself; the jigsaw slider can go to a captcha solver. |
 | Kasada | `x-kpsdk-*` headers, `ips.js` | Waits for the SDK's proof of work and keeps the latest `x-kpsdk-ct`/`st` tokens. |
 | HUMAN (PerimeterX) | `#px-captcha`, the block page | Press and hold on the widget with a human-paced pointer, released by the progress bar. |
 | Akamai Bot Manager | SEC-CPT and SBSD pages, the edge's "Access Denied" | Lets the interstitial clear under pointer input, with the SEC-CPT proof of work as a local fallback; one same-origin warm-up for edge blocks. |
@@ -63,7 +63,7 @@ Every response fetched with `solve_antibot=True` carries the outcome in `respons
 }
 ```
 
-Some sites put two vendors in a row, for example Imperva in front of DataDome. After a vendor is solved, the page is read and checked again, and the next vendor gets its turn, up to three. The top-level fields describe the layer that decided the outcome; `solved` is `True` only when every layer was solved. Each entry in `layers` has the same fields plus `cookies` (the names of the clearance cookies the solve earned, never their values), `used_solver` and `elapsed_s`.
+Some sites put two vendors in a row, for example Imperva in front of DataDome. After a vendor is solved, the page is read and checked again, and the next vendor gets its turn, up to three. Until a new document loads, that check keeps the status and headers the page was detected with, so a block page that never changed is never reported as solved. The top-level fields describe the layer that decided the outcome; `solved` is `True` only when every layer was solved. Each entry in `layers` has the same fields plus `cookies` (the names of the clearance cookies the solve earned, never their values), `used_solver`, `solver_kind` and `elapsed_s`. `solver_kind` is set on an unsolved layer that stopped at a captcha a captcha solver can act on (`turnstile`, `hcaptcha`, `awswaf` or `datadome_slider`), and is `None` when no solver would help (a ban, a block, a press-and-hold, an unsupported widget).
 
 The reasons you will see most:
 
@@ -73,7 +73,8 @@ The reasons you will see most:
 | `none` | Nothing was detected. |
 | `ban` | The vendor has banned this client or IP (DataDome's `t=bv`, for example). Retrying from the same IP makes it worse. |
 | `blocked`, `block:<rule>`, `unsolved:root_blocked` | The request was refused, and nothing on this visit changes that. |
-| `slider`, `captcha_required...` | An interactive captcha is showing, and no captcha solver that handles it is configured. |
+| `slider`, `captcha_required...` | An interactive captcha is showing, and no captcha solver that handles it is configured (`solver_kind` says which one would). |
+| `no_challenge` | DataDome was detected from its headers alone and the page never moved on (no new cookie, no new document). |
 | `still_detected` | The vendor's handler finished, but its challenge or block is still on the page. |
 | `timeout` | The deadline arrived first. |
 
@@ -85,8 +86,16 @@ The reasons you will see most:
 
 Bot managers read the browser from inside their own cross-site iframes, and headless Chrome under Playwright leaks there: the iframe sees an 800x600 screen under a page that claims 1920x1080, the window has no toolbar, and the user agent says `HeadlessChrome`. With `solve_antibot=True`, Scrapling makes a headless browser describe one coherent machine:
 
-- **On every page, before it navigates:** the real display's size, work area and colour depth, a window with a toolbar, and the browser's own user agent with full client hints, sent through CDP to the page and to every iframe and worker before they run (no init scripts, nothing in the page's JavaScript).
-- **At launch, for a session created with `solve_antibot=True` in headless mode:** the launch switches that pin the window to the screen origin, force an sRGB profile and hide scrollbars are replaced by the host's screen, window size and colour profile, and the context drops viewport emulation (`no_viewport`). This is applied when the browser starts, so it also covers launch options you edited yourself.
+- **On every page, before it navigates:** one display's size, work area and colour depth, a window with a toolbar, and the browser's own user agent with full client hints, sent through CDP to the page and to every iframe and worker before they run (no init scripts, nothing in the page's JavaScript).
+- **At launch, for a session created with `solve_antibot=True` in headless mode:** the launch switches that pin the window to the screen origin, force an sRGB profile and hide scrollbars are replaced by that display's screen, a normal window size and colour profile, and the context drops viewport emulation (`no_viewport`). This is applied when the browser starts, so it also covers launch options you edited yourself.
+
+The display is a common one for the platform (a 14" MacBook Pro screen on macOS, a 1080p screen elsewhere), not your own: the frames only need to agree with each other, and pages should not learn your monitors, their layout or your menu bar and Dock settings. To describe your real displays instead (every monitor, with its real geometry), call this before the session starts:
+
+```python
+from scrapling.engines.antibot.headless import set_display_policy
+
+set_display_policy('host')
+```
 
 The launch part is skipped for `headless=False`, for `cdp_url`, and when you set `viewport`, `no_viewport`, `screen` or `device_scale_factor` in `additional_args`. Pages read by the handlers are read in a fresh isolated world without a user gesture, so the page's own scripts can't tell that anything was read.
 
@@ -114,7 +123,9 @@ with StealthySession(solve_antibot=True, captcha_solver=router) as session:
 Any one key is enough. `from_config` returns `None` when no key is set, so you can pass its result straight through.
 
 - **Routing:** each challenge type has an ordered list of providers. If a provider fails, the next one is tried. Auth and balance errors put a provider on a cooldown for 10 minutes, and rate limits for 10 to 300 seconds. Change the order with `routes`, for example `{'turnstile': ['2captcha', 'capmonster']}`.
-- **Caps:** `max_solves_per_fetch` (2 by default), `max_attempts_per_solve` (3), `max_cost_usd_per_fetch`, `max_cost_usd_total` and `timeout`. Each request gets a fresh scope of the router, so the per-fetch caps apply to each page.
+- **Caps:** `max_solves_per_fetch` (2 by default), `max_attempts_per_solve` (3), `max_cost_usd_per_fetch`, `max_cost_usd_total` and `timeout`. Each request gets a fresh scope of the router, so the per-fetch caps apply to each page. To keep one budget across retries of the same page, pass `router.scope()` instead of the router: a scope is used as it is.
+- **Spend is counted when a task is sent**, at the provider's estimated price, and replaced by the provider's own figure when it reports one. A task abandoned at the deadline, cancelled or lost to network errors may still be billed, so it still counts; only failures providers do not bill (a refused task, an unsolvable challenge, no free worker) are refunded. A provider that fails after accepting a task is not followed by another one for the same challenge, and with a USD cap set a provider with no price for a kind is not used for it.
+- **What providers see:** for token tasks, the site key and the page's address cut to `scheme://host/path` (never its query string, fragment or credentials); for recognition tasks (sliders, image grids), only the images and the question.
 - **No proxy is ever sent to a provider** unless you set `allow_proxy=True`. Tasks run on the provider's own network (the "proxyless" task types).
 - **Experimental kinds** (DataDome sliders and Cloudflare challenge-page tokens) stay off unless you set `experimental=True`.
 - **Keys and tokens** are never logged, never included in `repr()` and never put in `response.meta`. Provider error messages that echo a key are redacted.

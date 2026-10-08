@@ -3,7 +3,9 @@
 * **Challenge** (``aws.challenge``, ``aws.challenge_page``, ``aws.token_status``). ``challenge.js`` interrogates
   the browser, solves a proof of work, stores ``aws-waf-token`` and reloads; a real browser passes it unaided. The
   solver waits while giving the page pointer input, and reloads once if the token changed but no new document
-  arrived. If the challenge escalates to a CAPTCHA, the CAPTCHA path takes over.
+  arrived. If the challenge escalates to a CAPTCHA, the CAPTCHA path takes over. ``aws.token_status`` (a blocking
+  status on a token site, no challenge script) gets :data:`TOKEN_STATUS_PATIENCE` seconds for the token to change
+  and otherwise ends as ``blocked``; nothing on that page clears it in place.
 * **CAPTCHA** (``aws.captcha``, ``aws.captcha_page``). Without a solver router this ends as ``captcha_required``.
   With one, in order:
 
@@ -38,6 +40,7 @@ from scrapling.core._types import TYPE_CHECKING, Any, Dict, List, Optional, Set,
 from scrapling.engines.antibot._pagestate import Recheck, bounded, reload_page, site_cookies, solver_name, supports
 from scrapling.engines.antibot._pointer import human_path, move_along, sleep_until, viewport_size, wander
 from scrapling.engines.antibot.base import Detection, SolveResult, remaining
+from scrapling.engines.antibot.solvers.base import provider_url
 
 if TYPE_CHECKING:  # pragma: no cover
     from scrapling.engines.antibot.awswaf import AwsWafHandler
@@ -45,7 +48,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 __all__ = ["solve_aws_waf", "aws_scripts", "problem_question", "TOKEN_COOKIE"]
 
-TOKEN_COOKIE = "aws-waf-token"
+TOKEN_COOKIE = "aws-waf-token"  # nosec B105 - the cookie's name, not a secret
 #: Hosts whose ``/problem`` and ``/verify`` answers belong to AWS WAF's captcha (subdomains included).
 AWS_HOSTS = ("awswaf.com",)
 
@@ -57,6 +60,11 @@ RELOAD_AFTER = 2.5  # seconds a new token may wait for the page's own reload
 SOLVER_MARGIN = 3.0
 PROBLEM_WAIT = 8.0
 RESULT_WAIT = 8.0  # how long a stored token or a confirmed puzzle gets to clear the page
+#: Seconds an ``aws.token_status`` page (no challenge script on it) gets for its token to change before the solver
+#: calls it a block.
+TOKEN_STATUS_PATIENCE = 8.0
+#: The solver kind reported for a CAPTCHA the router could clear (``SolveResult.solver_kind``).
+SOLVER_KIND = "awswaf"
 GRID = 3
 
 _VOUCHER_JS = """async ([url, voucher, existing]) => {
@@ -246,10 +254,14 @@ class _Run:
     async def clear_streak(self, stop: float) -> Optional[Detection]:
         return await self.check.current(stop)
 
-    async def result(self, solved: bool, reason: str, used_solver: Optional[str] = None) -> SolveResult:
+    async def result(
+        self, solved: bool, reason: str, used_solver: Optional[str] = None, solver_kind: Optional[str] = None
+    ) -> SolveResult:
         cookies = await site_cookies(self.page, self.deadline)
         names = [TOKEN_COOKIE] if TOKEN_COOKIE in cookies else []
-        return SolveResult(solved=solved, reason=reason, cookies=names, used_solver=used_solver)
+        return SolveResult(
+            solved=solved, reason=reason, cookies=names, used_solver=used_solver, solver_kind=solver_kind
+        )
 
     async def wait_cleared(self, timeout: float) -> bool:
         return await self.check.wait_cleared(self.deadline, timeout)
@@ -263,10 +275,14 @@ class _Run:
         docs_at_token = 0
         reloaded = False
         next_wander = monotonic() + self.rng.uniform(0.3, 1.0)
+        # A blocking status with no challenge script: give the token a moment to change, then call it a block.
+        patience = monotonic() + TOKEN_STATUS_PATIENCE if self.det.rule == "aws.token_status" else None
         while remaining(self.deadline) > 0.2:
             current = await self.clear_streak(self.deadline)
             if current is None:
                 return await self.result(True, "solved")
+            if patience is not None and token_at is None and monotonic() >= patience:
+                return await self.result(False, "blocked")
             if current.kind == "captcha":
                 self._debug("AWS WAF escalated the challenge to a CAPTCHA")
                 self.det.details["escalated"] = current.rule
@@ -307,7 +323,7 @@ class _Run:
 
     async def captcha(self) -> SolveResult:
         if self.solver is None:
-            return await self.result(False, "captcha_required")
+            return await self.result(False, "captcha_required", solver_kind=SOLVER_KIND)
         reasons: List[str] = []
         used: Optional[str] = None
         if supports(self.solver, "awswaf_images"):
@@ -326,8 +342,8 @@ class _Run:
                 reasons.append(result.reason)
                 used = result.used_solver or used
         if not reasons:
-            return await self.result(False, "captcha_required:no_solver_kind")
-        return await self.result(False, "captcha_required:" + ";".join(reasons), used)
+            return await self.result(False, "captcha_required:no_solver_kind", solver_kind=SOLVER_KIND)
+        return await self.result(False, "captcha_required:" + ";".join(reasons), used, solver_kind=SOLVER_KIND)
 
     async def token(self, kind: str) -> SolveResult:
         """A proxyless token (``awswaf``) or voucher (``awswaf_voucher``) from the router, set as the cookie."""
@@ -347,7 +363,9 @@ class _Run:
         left = remaining(self.deadline) - SOLVER_MARGIN
         try:
             token = await wait_for(
-                self.solver.solve_token(kind, sitekey, self.page.url, deadline=self.deadline - SOLVER_MARGIN, **extra),
+                self.solver.solve_token(
+                    kind, sitekey, provider_url(self.page.url), deadline=self.deadline - SOLVER_MARGIN, **extra
+                ),
                 timeout=max(0.1, left),
             )
         except Exception as error:
@@ -414,11 +432,11 @@ class _Run:
             return SolveResult(solved=False, reason="awswaf_images:no_time", used_solver=provider)
         try:
             answer = await wait_for(
+                # Only the puzzle images and the question leave the machine (no page URL).
                 self.solver.recognize(
                     "awswaf_images",
                     images,
                     question=question,
-                    page_url=self.page.url,
                     deadline=self.deadline - SOLVER_MARGIN,
                 ),
                 timeout=left,

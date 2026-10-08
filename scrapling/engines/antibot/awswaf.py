@@ -77,7 +77,7 @@ class AwsWafHandler:
             return None
 
         def found(kind: Kind, rule: str) -> Detection:
-            return Detection(vendor=self.vendor, kind=kind, rule=rule, details=parse_aws_challenge(s.html))
+            return Detection(vendor=self.vendor, kind=kind, rule=rule, details=parse_aws_challenge(s.html), signal=s)
 
         if action == "challenge":
             return found("challenge", "aws.challenge")

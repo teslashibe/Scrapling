@@ -81,7 +81,7 @@ class TestKasada:
         page = FakePage(URL, BLOCK)
         watch_kasada(page)
         tl_answer(page, ct="0early", st="1700000000000")  # before solve() is called
-        page.navigate(CONTENT)
+        page.at(0.1, lambda p: p.navigate(CONTENT))
         result, _ = await solve(page, detect())
         assert result.solved and kasada_tokens(page)["st"] == 1700000000000
         assert len(page.listeners["response"]) == 1, "a caller's watcher stays attached until it unwatches"

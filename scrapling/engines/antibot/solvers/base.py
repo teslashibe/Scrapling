@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Protocol, Tuple, runtime_checkable
+from urllib.parse import urlsplit
+
+from scrapling.core._types import Any, Dict, FrozenSet, List, Mapping, Optional, Protocol, Tuple, runtime_checkable
 
 __all__ = [
     "TOKEN_KINDS",
@@ -43,6 +45,8 @@ __all__ = [
     "SolverTimeout",
     "SolverBudgetExceeded",
     "SolverProxyNotAllowed",
+    "FREE_FAILURES",
+    "provider_url",
     "redact",
 ]
 
@@ -243,10 +247,14 @@ class SolverError(Exception):
     :param code: The provider's error code (e.g. ``ERROR_ZERO_BALANCE``) or an internal code.
     :param fallback: Whether a router should try the next provider.
     :param cooldown_s: If set, the router stops using this provider for this many seconds (bad key, no balance…).
+    :param task_created: Whether the provider had accepted a task (``createTask`` returned a task id) when this was
+        raised: ``True`` means the provider may still finish and bill it, ``False`` that nothing was billed, ``None``
+        that it is not known (a third-party solver). Routers use it for spend accounting.
     """
 
     default_fallback: bool = True
     default_cooldown_s: Optional[float] = None
+    task_created: Optional[bool] = None
 
     def __init__(
         self,
@@ -256,7 +264,9 @@ class SolverError(Exception):
         code: str = "",
         fallback: Optional[bool] = None,
         cooldown_s: Optional[float] = None,
+        task_created: Optional[bool] = None,
     ):
+        self.task_created = task_created
         self.provider = provider
         self.code = code
         self.message = message
@@ -323,6 +333,41 @@ class SolverProxyNotAllowed(SolverError):
     """A proxy was passed while proxies are disabled (the default for home nodes)."""
 
     default_fallback = False
+
+
+#: Failures providers do not bill: the task was refused, could not be solved, or never reached a worker.
+FREE_FAILURES: Tuple[type, ...] = (
+    SolverConfigError,
+    SolverAuthError,
+    SolverBalanceError,
+    SolverUnsupported,
+    SolverBadRequest,
+    SolverUnsolvable,
+    SolverRateLimited,
+    SolverBudgetExceeded,
+    SolverProxyNotAllowed,
+)
+
+
+def provider_url(url: str) -> str:
+    """What a provider is told about the page: ``scheme://host[:port]/path`` with no query, fragment or credentials.
+
+    Token tasks are bound to the page's host (and at most its path); the query string and fragment can carry
+    signed-link tokens, OAuth codes or session ids that no provider needs. Anything that is not an http(s) URL is
+    returned as an empty string.
+    """
+    try:
+        parts = urlsplit(str(url or "").strip())
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:
+        return ""
+    if parts.scheme.lower() not in ("http", "https") or not host:
+        return ""
+    if ":" in host:  # an IPv6 literal
+        host = f"[{host}]"
+    netloc = f"{host}:{port}" if port else host
+    return f"{parts.scheme.lower()}://{netloc}{parts.path or '/'}"
 
 
 def redact(text: str, secrets: Tuple[str, ...]) -> str:

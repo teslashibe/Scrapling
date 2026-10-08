@@ -181,6 +181,9 @@ class FakePage:
         self.tick()
         return self.html
 
+    async def wait_for_load_state(self, *_: Any, **__: Any) -> None:
+        self.tick()
+
     async def reload(self, **_: Any) -> None:
         self.reloads += 1
         if self.on_reload is not None:

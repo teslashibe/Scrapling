@@ -8,13 +8,16 @@ The stealth sessions call these when ``solve_antibot`` is on:
    touching the page's own JavaScript world, runs :func:`~scrapling.engines.antibot.detect.detect`, and hands a
    detection to its vendor's handler within the fetch's deadline. A solved page is read and detected again, because
    vendors are layered (Imperva in front of DataDome, for example); a vendor that is still detected after its own
-   handler reported success is reported unsolved, never solved twice.
+   handler reported success is reported unsolved, never solved twice. Until a new main-frame document arrives the
+   re-read keeps the detected document's status and headers, so a block page that never changed is never taken
+   for a solved one.
 3. :func:`release_page` before the page goes back to the pool.
 
 The outcome is a JSON-safe dict for ``response.meta["antibot"]``: the deciding layer's ``vendor``, ``kind``,
-``rule``, ``solved`` and ``reason`` at the top level, every layer under ``layers``, and the captcha solver's
-summary (attempts, estimated cost, never keys or tokens) under ``solver`` when one was used. A page with nothing
-detected reports ``vendor: None`` and ``reason: "none"``.
+``rule``, ``solved`` and ``reason`` at the top level, every layer under ``layers`` (each with the ``solver_kind`` a
+captcha solver would need when the layer stopped at one), and the captcha solver's summary (attempts, estimated
+cost, never keys or tokens) under ``solver`` when one was used. A page with nothing detected reports
+``vendor: None`` and ``reason: "none"``.
 """
 
 from __future__ import annotations
@@ -160,6 +163,34 @@ async def read_signal(
     )
 
 
+def _fetch_scope(solver: Any) -> Any:
+    """The solver scope for one fetch: ``solver`` itself when it already is a scope, else a new one."""
+    if solver is None or getattr(solver, "is_scope", False) or not hasattr(solver, "scope"):
+        return solver
+    return solver.scope()
+
+
+async def _read_document(page: Any, document: Callable[[], Any], deadline: float) -> Signal:
+    """Read a signal whose status and headers belong to the document it shows.
+
+    The status and headers come from the main frame's latest response (``document()``), so a page that did not
+    reload keeps the status it was detected with. A document that arrives while the page is read (a challenge
+    reloading under the read) is read again with its own response: a new page is never judged by the old one's
+    status, nor an old page by the new one's.
+    """
+    response = document()
+    status, headers = await _document_facts(response, deadline)
+    signal = await read_signal(page, status=status, headers=headers, deadline=deadline)
+    for _ in range(2):
+        latest = document()
+        if latest is response or remaining(deadline) <= 0.5:
+            break
+        response = latest
+        status, headers = await _document_facts(response, deadline)
+        signal = await read_signal(page, status=status, headers=headers, deadline=deadline)
+    return signal
+
+
 def error_outcome(error: BaseException) -> Dict[str, Any]:
     """The ``response.meta["antibot"]`` value when the anti-bot pass itself failed (the fetch still returns)."""
     return {
@@ -182,6 +213,7 @@ def _layer(det: Detection, result: SolveResult, elapsed: float) -> Dict[str, Any
         "reason": result.reason,
         "cookies": list(result.cookies or ()),
         "used_solver": result.used_solver,
+        "solver_kind": None if result.solved else result.solver_kind,
         "elapsed_s": round(elapsed, 2),
     }
 
@@ -200,29 +232,24 @@ async def solve_page(
     :param page: The Patchright/Playwright async page (or the sync bridge's view of one), after navigation.
     :param document: Returns the main frame's latest document response (async API shape), or ``None``.
     :param deadline: :func:`time.monotonic` value the pass never runs past (plus :data:`SOLVE_GRACE` at most).
-    :param solver: An operator-paid :class:`~scrapling.engines.antibot.solvers.SolverRouter`; one scope is used
-        per call, so its per-fetch caps apply to this page.
+    :param solver: An operator-paid :class:`~scrapling.engines.antibot.solvers.SolverRouter`. A router gets one
+        new scope per call, so its per-fetch caps apply to this page; a scope (``router.scope()``) is used as it
+        is, so a caller that retries a fetch can keep one budget and one spend ledger across the attempts.
     :param log: Logger (Scrapling's by default).
     :param max_layers: Vendors solved one after another before giving up.
     :return: The outcome for ``response.meta["antibot"]`` (see the module docstring).
     """
     log = log or default_log
     started = monotonic()
-    scope = solver.scope() if solver is not None and hasattr(solver, "scope") else solver
+    scope = _fetch_scope(solver)
     layers: List[Dict[str, Any]] = []
 
-    response = document()
-    status, headers = await _document_facts(response, deadline)
-    signal = await read_signal(page, status=status, headers=headers, deadline=deadline)
+    signal = await _read_document(page, document, deadline)
     det = detect(signal)
     if det is None and looks_empty(signal.html) and remaining(deadline) > 3.0:
         # Read while a challenge was replacing the document: look once more after the next load.
         await bounded(page.wait_for_load_state("load"), deadline, None, cap=2.0)
-        latest = document()
-        if latest is not response:
-            response = latest
-            status, headers = await _document_facts(response, deadline)
-        signal = await read_signal(page, status=status, headers=headers, deadline=deadline)
+        signal = await _read_document(page, document, deadline)
         det = detect(signal)
 
     solved_vendors: List[str] = []
@@ -259,14 +286,9 @@ async def solve_page(
         if not result.solved:
             break
         solved_vendors.append(det.vendor)
-        latest = document()
-        if latest is not response:
-            response = latest
-            status, headers = await _document_facts(response, deadline)
-        else:
-            # Solved in place: the first response's status and headers describe the challenge, not this page.
-            status, headers = None, {}
-        signal = await read_signal(page, status=status, headers=headers, deadline=deadline)
+        # Without a new document the page is still the one that was detected, so its status and headers still
+        # apply: a block page that never reloaded must read as the block it is, whatever the handler said.
+        signal = await _read_document(page, document, deadline)
         det = detect(signal)
 
     last = layers[-1] if layers else None

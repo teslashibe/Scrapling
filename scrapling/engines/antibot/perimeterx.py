@@ -81,11 +81,12 @@ class PerimeterXHandler:
                     kind="captcha",
                     rule="px.hold",
                     details={**details, "challenge": "press_and_hold"},
+                    signal=s,
                 )
         if blocked_header:
-            return Detection(vendor=self.vendor, kind="block", rule="px.header", details=details)
+            return Detection(vendor=self.vendor, kind="block", rule="px.header", details=details, signal=s)
         if s.status_in(403, 429) and markers and s.gate() and not s.marked_by_other(self.vendor):
-            return Detection(vendor=self.vendor, kind="block", rule="px.block", details=details)
+            return Detection(vendor=self.vendor, kind="block", rule="px.block", details=details, signal=s)
         return None
 
     async def solve(

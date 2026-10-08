@@ -1,4 +1,7 @@
-"""Operator-paid CAPTCHA solver clients (CapMonster Cloud, CapSolver, 2Captcha), a router and token injectors.
+"""Operator-paid CAPTCHA solver clients (CapMonster Cloud, CapSolver, 2Captcha) and a router.
+
+The anti-bot handlers inject what a solver returns themselves (``cloudflare``, ``_awswaf_solver``,
+``_imperva_solver``); this package only talks to the providers.
 
 Nothing here runs unless the caller supplies provider keys, e.g.::
 
@@ -26,25 +29,13 @@ from .base import (
     SolverUnsolvable,
     SolverUnsupported,
     Token,
+    provider_url,
 )
 from ._client import CreateTaskSolver, UrllibTransport, recaptcha_label_id, recaptcha_label_text
 from .capmonster import CapMonsterSolver
 from .capsolver import CapSolverSolver
 from .twocaptcha import TwoCaptchaSolver
 from .router import DEFAULT_ROUTES, SolverRouter
-from .inject import (
-    capture_script,
-    evaluate_main_world,
-    find_widgets,
-    inject_hcaptcha,
-    inject_recaptcha,
-    inject_token,
-    inject_turnstile,
-    install_capture,
-    read_captured,
-    set_aws_waf_cookie,
-    token_request,
-)
 
 __all__ = [
     "ALL_KINDS",
@@ -75,15 +66,5 @@ __all__ = [
     "SolverRouter",
     "recaptcha_label_id",
     "recaptcha_label_text",
-    "capture_script",
-    "install_capture",
-    "evaluate_main_world",
-    "read_captured",
-    "find_widgets",
-    "token_request",
-    "inject_turnstile",
-    "inject_recaptcha",
-    "inject_hcaptcha",
-    "inject_token",
-    "set_aws_waf_cookie",
+    "provider_url",
 ]

@@ -308,3 +308,133 @@ async def test_router_logs_no_secrets(mock, caplog):
     token = await router.solve_token("turnstile", TS_KEY, PAGE)
     text = " ".join(r.getMessage() for r in caplog.records) + json.dumps(router.summary())
     assert mock.key not in text and str(token) not in text
+
+
+# ---- spend accounting: booked when a task is sent ----------------------------------------------------------------
+
+
+class _Priced:
+    """A custom solver with a price list that fails (or answers) the way it is told."""
+
+    def __init__(self, name, error=None, prices=None, cost=None):
+        self.name = name
+        self.error = error
+        self.prices = {"turnstile": 2.0} if prices is None else prices
+        self.cost = cost
+        self.calls = 0
+
+    def supports(self, kind):
+        return True
+
+    async def solve_token(self, kind, sitekey, page_url, **extra):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return Token("tok", kind=kind, provider=self.name, cost_usd=self.cost, cost_source="reported" if self.cost else None)
+
+    async def recognize(self, kind, images, **extra):  # pragma: no cover - not used
+        raise NotImplementedError
+
+
+@pytest.mark.asyncio
+async def test_a_task_abandoned_at_the_deadline_is_still_booked(mock):
+    mock.hang.add("capmonster")
+    router = build(mock, min_attempt_s=0.5).scope()
+    for solver in router._shared.solvers.values():
+        solver.max_polls = 10_000
+        solver.poll_interval = 0.05
+    with pytest.raises(SolverTimeout):
+        await router.solve_token("turnstile", TS_KEY, PAGE, deadline=time.monotonic() + 0.8)
+    # CapMonster accepted the task and may still finish and bill it: its estimate stays on the ledger.
+    assert router.spent_usd == pytest.approx(0.0013) and router.summary()["cost_usd"] == pytest.approx(0.0013)
+    assert router.records[-1].cost_source == "estimated"
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_call_keeps_its_booking(mock):
+    mock.hang.add("capmonster")
+    router = build(mock).scope()
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(router.solve_token("turnstile", TS_KEY, PAGE), 0.6)
+    assert router.spent_usd == pytest.approx(0.0013) and router.records[-1].error_code == "CANCELLED"
+    assert router.total_spent_usd == pytest.approx(0.0013)
+
+
+@pytest.mark.asyncio
+async def test_refused_tasks_are_refunded(mock):
+    mock.create_fail["capmonster"] = ("ERROR_ZERO_BALANCE", "")
+    router = build(mock).scope()
+    token = await router.solve_token("turnstile", TS_KEY, PAGE)
+    assert token.provider == "capsolver" and router.spent_usd == pytest.approx(0.0012)
+
+
+@pytest.mark.asyncio
+async def test_a_provider_that_fails_after_accepting_the_task_is_not_followed_by_another():
+    from scrapling.engines.antibot.solvers import SolverUnavailable
+
+    lost = _Priced("first", error=SolverUnavailable("network", code="NETWORK", task_created=True))
+    second = _Priced("second")
+    router = SolverRouter([lost, second], routes={"turnstile": ["first", "second"]}).scope()
+    with pytest.raises(SolverUnavailable):
+        await router.solve_token("turnstile", TS_KEY, PAGE)
+    assert (lost.calls, second.calls) == (1, 0)
+    assert router.spent_usd == pytest.approx(0.002)  # the lost task may be billed
+    # The same failure before any task existed falls back, and costs nothing.
+    early = _Priced("first", error=SolverUnavailable("network", code="NETWORK", task_created=False))
+    router = SolverRouter([early, _Priced("second", cost=0.0015)], routes={"turnstile": ["first", "second"]}).scope()
+    assert (await router.solve_token("turnstile", TS_KEY, PAGE)) == "tok"
+    assert router.spent_usd == pytest.approx(0.0015)  # the provider's reported cost replaces the estimate
+
+
+@pytest.mark.asyncio
+async def test_a_kind_without_a_price_is_refused_under_a_spend_cap():
+    unpriced = _Priced("unpriced", prices={})
+    capped = SolverRouter([unpriced], routes={"turnstile": ["unpriced"]}, max_cost_usd_total=1.0).scope()
+    with pytest.raises(SolverBudgetExceeded) as info:
+        await capped.solve_token("turnstile", TS_KEY, PAGE)
+    assert info.value.code == "NO_PRICE" and unpriced.calls == 0
+    uncapped = SolverRouter([unpriced], routes={"turnstile": ["unpriced"]}).scope()
+    assert (await uncapped.solve_token("turnstile", TS_KEY, PAGE)) == "tok"
+
+
+def test_every_built_in_kind_has_a_price():
+    from scrapling.engines.antibot.solvers import CapMonsterSolver, CapSolverSolver, TwoCaptchaSolver
+
+    for cls in (CapMonsterSolver, CapSolverSolver, TwoCaptchaSolver):
+        assert (cls.token_kinds | cls.recognition_kinds) <= set(cls.default_prices), cls.name
+
+
+def test_per_image_kinds_are_estimated_per_image():
+    from scrapling.engines.antibot.solvers import CapMonsterSolver
+    from scrapling.engines.antibot.solvers.router import _price
+
+    solver = CapMonsterSolver("k" * 12)
+    assert _price(solver, "recaptcha_grid", 9) == pytest.approx(9 * 0.04 / 1000)
+    assert _price(solver, "turnstile", 9) == pytest.approx(1.30 / 1000)
+    assert _price(solver, "no_such_kind") is None
+
+
+def test_scopes_say_they_are_scopes(mock):
+    router = build(mock)
+    assert router.is_scope is False and router.scope().is_scope is True
+
+
+# ---- what providers are told about the page ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_providers_get_the_page_host_and_path_only(mock):
+    router = build(mock).scope()
+    await router.solve_token(
+        "turnstile", TS_KEY, "https://user:pw@shop.example.com:8443/checkout/pay?session=abc&code=xyz#frag"
+    )
+    assert mock.created("capmonster")[-1]["websiteURL"] == "https://shop.example.com:8443/checkout/pay"
+
+
+def test_provider_url():
+    from scrapling.engines.antibot.solvers import provider_url
+
+    assert provider_url("https://Example.com/a/b?x=1#y") == "https://example.com/a/b"
+    assert provider_url("https://example.com") == "https://example.com/"
+    assert provider_url("http://[::1]:8080/p?q") == "http://[::1]:8080/p"
+    assert provider_url("javascript:alert(1)") == "" and provider_url("") == ""

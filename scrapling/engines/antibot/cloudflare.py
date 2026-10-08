@@ -33,6 +33,7 @@ from scrapling.engines.antibot.base import (
     page_signal,
     remaining,
 )
+from scrapling.engines.antibot.solvers.base import provider_url
 
 if TYPE_CHECKING:  # pragma: no cover
     from scrapling.engines.antibot.solvers.router import SolverRouter
@@ -135,7 +136,7 @@ class CloudflareHandler:
             details["ray"] = ray
 
         def found(kind: Kind, rule: str, **extra: Any) -> Detection:
-            return Detection(vendor=self.vendor, kind=kind, rule=rule, details={**details, **extra})
+            return Detection(vendor=self.vendor, kind=kind, rule=rule, details={**details, **extra}, signal=s)
 
         if mitigated and (s.is_error or s.status is None or on_page):
             return found("challenge", "cf.challenge")
@@ -177,20 +178,27 @@ class CloudflareHandler:
         if remaining(deadline) <= _RESERVE_S:
             return SolveResult(solved=False, reason="timeout")
         before = await _cookie_values(page, CF_COOKIES)
-        for run in range(1, _MAX_RUNS + 1):
+        left: Detection = det
+        timed_out = False
+        for _ in range(_MAX_RUNS):
             timed_out = await self._run_scrapling_solver(page, deadline, log)
             await _settle(page, deadline)
-            left = self.detect(await page_signal(page))
-            if left is None:
+            current = self.detect(await page_signal(page))
+            if current is None:
                 return SolveResult(solved=True, reason="solved", cookies=await _earned(page, before))
+            left = current
             if left.kind not in SOLVABLE_KINDS:
                 # The challenge turned into a block (1010, 1015, a WAF rule): nothing more to try.
                 return SolveResult(solved=False, reason=f"{left.kind}:{left.rule}")
             if timed_out or left.kind == "captcha" or remaining(deadline) <= 2 * _RESERVE_S:
                 break
-        if left.kind == "captcha" and solver is not None and left.details.get("sitekey"):
+        # A Turnstile gate with a site key is what an operator's solver can clear (``turnstile`` token task).
+        solver_kind = "turnstile" if left.kind == "captcha" and left.details.get("sitekey") else None
+        if solver_kind and solver is not None:
             return await self._solve_turnstile(page, left, before, deadline=deadline, solver=solver, log=log)
-        return SolveResult(solved=False, reason="timeout" if timed_out else f"unsolved:{left.rule}")
+        return SolveResult(
+            solved=False, reason="timeout" if timed_out else f"unsolved:{left.rule}", solver_kind=solver_kind
+        )
 
     @staticmethod
     async def _run_scrapling_solver(page: Any, deadline: float, log: Any) -> bool:
@@ -242,15 +250,15 @@ class CloudflareHandler:
         used = None
         try:
             token = await wait_for(
-                solver.solve_token("turnstile", det.details["sitekey"], page.url, **extra),
+                solver.solve_token("turnstile", det.details["sitekey"], provider_url(page.url), **extra),
                 timeout=max(0.1, remaining(deadline) - _RESERVE_S),
             )
             used = getattr(token, "provider", None) or getattr(solver, "name", None) or "solver"
         except AsyncTimeoutError:
-            return SolveResult(solved=False, reason="timeout")
+            return SolveResult(solved=False, reason="timeout", solver_kind="turnstile")
         except Exception as error:
             log.debug(f"Turnstile solver failed: {error}")
-            return SolveResult(solved=False, reason="unsolved:solver_error")
+            return SolveResult(solved=False, reason="unsolved:solver_error", solver_kind="turnstile")
         try:
             # Only the widget's response field and its declared callback are touched.
             # The callback is a page function, so this runs in the page's own world.
@@ -265,7 +273,9 @@ class CloudflareHandler:
         left = self.detect(await page_signal(page))
         if left is None:
             return SolveResult(solved=True, reason="solved", cookies=await _earned(page, before), used_solver=used)
-        return SolveResult(solved=False, reason="unsolved:turnstile_token_not_accepted", used_solver=used)
+        return SolveResult(
+            solved=False, reason="unsolved:turnstile_token_not_accepted", used_solver=used, solver_kind="turnstile"
+        )
 
 
 async def _settle(page: Any, deadline: float) -> None:

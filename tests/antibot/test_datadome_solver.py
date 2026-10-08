@@ -246,6 +246,7 @@ class TestCaptcha:
             start = monotonic()
             result = await handler.solve(page, det, deadline=start + 20, solver=None, log=log)
             assert (result.solved, result.reason, result.used_solver) == (False, "slider", None)
+            assert result.solver_kind == "datadome_slider"  # a solver could take it from here
             assert monotonic() - start < 6
 
     @pytest.mark.asyncio
@@ -264,7 +265,7 @@ class TestCaptcha:
         kind, heads, options = solver.calls[0]
         assert kind == "datadome_slider"
         assert all(h.startswith(b"\x89PNG") for h in heads) and len(heads) == 2
-        assert "proxy" not in options
+        assert "proxy" not in options and "page_url" not in options  # only the two images leave the machine
         drags = [r["slider"] for r in state.reports if "slider" in r]
         assert drags and drags[-1]["ok"] and drags[-1]["trusted"]
 
@@ -284,14 +285,18 @@ class TestCaptcha:
         assert drags and drags[-1]["ok"] and drags[-1]["trusted"]
 
     @pytest.mark.asyncio
-    async def test_slide_to_target_without_a_solver_still_stops(self, local_frames):
-        local_frames.reset()
+    async def test_slide_to_target_needs_no_solver_at_all(self, local_frames):
+        """The simple slider shows its target, so it is dragged there even with no solver configured."""
+        state = local_frames.reset()
         handler = DataDomeHandler()
         async with headless_page() as page:
             await harden_page(page)
             det = handler.detect(await _open(page, local_frames.url("/dd/simple")))
-            result = await handler.solve(page, det, deadline=monotonic() + 20, solver=None, log=log)
-            assert (result.solved, result.reason) == (False, "slider")
+            result = await handler.solve(page, det, deadline=monotonic() + 30, solver=None, log=log)
+            assert (result.solved, result.reason, result.used_solver) == (True, "solved", None), state.reports
+            assert "Products" in await _content(page)
+        drags = [r["slider"] for r in state.reports if "slider" in r]
+        assert drags and drags[-1]["ok"] and drags[-1]["trusted"]
 
     @pytest.mark.asyncio
     async def test_wrong_answers_end_with_slider_failed(self, local_frames):
@@ -311,3 +316,42 @@ class TestCaptcha:
             first = await harden_page(page)
             assert get_hardening(page) is first
             assert await harden_page(page) is first
+
+
+class TestHeaderOnlyDetection:
+    """A check detected from headers alone has no verdict in the DOM to watch, so only a new cookie or a new
+    document counts; an unchanged page is never reported solved."""
+
+    @staticmethod
+    def _page(monkeypatch, html):
+        from .iak_fakes import FakePage
+
+        async def fake_quiet(page, frame, expression, timeout=2.0):
+            return page.html
+
+        monkeypatch.setattr(datadome, "quiet_evaluate", fake_quiet)
+        page = FakePage("https://www.example.test/item", html)
+        page.context.store["datadome"] = "same"
+        return page
+
+    HTML = "<html><head><title>x</title></head><body><p>Please enable JS and disable any ad blocker</p></body></html>"
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_page_ends_as_no_challenge(self, monkeypatch):
+        page = self._page(monkeypatch, self.HTML)
+        signal = Signal(url=page.url, status=403, headers={"x-dd-b": "3"}, cookies={"datadome": "same"}, html=self.HTML)
+        handler = DataDomeHandler(no_frame_grace=0.6)
+        det = handler.detect(signal)
+        assert det is not None and (det.kind, det.rule) == ("device_check", "dd.device")
+        result = await handler.solve(page, det, deadline=monotonic() + 5, solver=None, log=log)
+        assert (result.solved, result.reason) == (False, "no_challenge")
+
+    @pytest.mark.asyncio
+    async def test_a_new_document_without_the_verdict_is_solved(self, monkeypatch):
+        page = self._page(monkeypatch, self.HTML)
+        page.at(0.3, lambda p: p.navigate("<html><body>" + "<p>Products and prices.</p>" * 20 + "</body></html>"))
+        signal = Signal(url=page.url, status=403, headers={"x-dd-b": "3"}, cookies={"datadome": "same"}, html=self.HTML)
+        handler = DataDomeHandler(no_frame_grace=2.0, poll=0.1)
+        det = handler.detect(signal)
+        result = await handler.solve(page, det, deadline=monotonic() + 5, solver=None, log=log)
+        assert (result.solved, result.reason) == (True, "solved")

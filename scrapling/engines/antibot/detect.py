@@ -25,13 +25,15 @@ def detect_all(s: Signal) -> List[Detection]:
             log.debug(f"anti-bot detector {handler.vendor} failed: {error}")
             continue
         if det is not None:
+            if det.signal is None:
+                det.signal = s
             found.append(det)
     return found
 
 
 def detect(s: Signal) -> Optional[Detection]:
     """The first vendor detection for ``s`` in the fixed detection order, or ``None`` for a page with no challenge,
-    captcha or block on it."""
+    captcha or block on it. The detection keeps ``s`` as its :attr:`~Detection.signal`."""
     for handler in registry.HANDLERS:
         try:
             det = handler.detect(s)
@@ -39,5 +41,7 @@ def detect(s: Signal) -> Optional[Detection]:
             log.debug(f"anti-bot detector {handler.vendor} failed: {error}")
             continue
         if det is not None:
+            if det.signal is None:
+                det.signal = s
             return det
     return None
