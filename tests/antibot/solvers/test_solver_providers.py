@@ -703,3 +703,32 @@ def test_token_ttl():
     token = Token("abc", kind="recaptcha_v2", provider="x", created_at=time.monotonic() - 121)
     assert token.expired
     assert not Token("abc", kind="turnstile", provider="x").expired
+
+
+def test_urllib_transport_takes_a_verifying_ssl_context():
+    import ssl
+    import urllib.request
+
+    from scrapling.engines.antibot.solvers import UrllibTransport
+
+    context = ssl.create_default_context()
+    transport = UrllibTransport(ssl_context=context)
+    https = [h for h in transport._opener.handlers if isinstance(h, urllib.request.HTTPSHandler)]
+    assert len(https) == 1 and https[0]._context is context
+
+    unverified = ssl.create_default_context()
+    unverified.check_hostname = False
+    unverified.verify_mode = ssl.CERT_NONE
+    with pytest.raises(ValueError):
+        UrllibTransport(ssl_context=unverified)
+
+
+@pytest.mark.asyncio
+async def test_solver_with_ssl_context_transport(mock, make):
+    import ssl
+
+    from scrapling.engines.antibot.solvers import UrllibTransport
+
+    solver = make("capmonster", transport=UrllibTransport(ssl_context=ssl.create_default_context()))
+    token = await solver.solve_token("turnstile", TS_KEY, PAGE)
+    assert token

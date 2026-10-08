@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -93,10 +94,22 @@ class UrllibTransport:
     :param trust_env: Honour ``HTTP(S)_PROXY`` environment variables. Off by default: solver APIs must be reached
         directly (CapSolver asks clients not to call it through proxies), and a node's environment may point at a
         proxy meant for something else.
+    :param ssl_context: The TLS context for HTTPS calls, such as one built from ``certifi`` when the interpreter's
+        default certificate store is not usable. ``None`` uses Python's default verified context.
     """
 
-    def __init__(self, *, trust_env: bool = False, user_agent: str = "scrapling-antibot/1.0"):
+    def __init__(
+        self,
+        *,
+        trust_env: bool = False,
+        user_agent: str = "scrapling-antibot/1.0",
+        ssl_context: Optional[ssl.SSLContext] = None,
+    ):
         handlers: List[urllib.request.BaseHandler] = [] if trust_env else [urllib.request.ProxyHandler({})]
+        if ssl_context is not None:
+            if ssl_context.verify_mode != ssl.CERT_REQUIRED or not ssl_context.check_hostname:
+                raise ValueError("ssl_context must verify certificates and host names")
+            handlers.append(urllib.request.HTTPSHandler(context=ssl_context))
         self._opener = urllib.request.build_opener(*handlers)
         self._user_agent = user_agent
 
