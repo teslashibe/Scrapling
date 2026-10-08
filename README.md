@@ -258,6 +258,7 @@ MySpider().start()
 - **HTTP Requests**: Fast and stealthy HTTP requests with the `Fetcher` class. Can impersonate browsers' TLS fingerprint, headers, and use HTTP/3.
 - **Dynamic Loading**: Fetch dynamic websites with full browser automation through the `DynamicFetcher` class supporting Playwright's Chromium and Google's Chrome.
 - **Anti-bot Bypass**: Advanced stealth capabilities with `StealthyFetcher` and fingerprint spoofing. Can easily bypass all types of Cloudflare's Turnstile/Interstitial with automation.
+- **Anti-bot Vendors**: With `solve_antibot=True`, the stealth fetchers recognise DataDome, HUMAN (PerimeterX), Akamai, Imperva, AWS WAF, Kasada and Cloudflare challenges, solve them in the browser, and report the outcome in `response.meta['antibot']`. Optional paid captcha solvers (CapMonster Cloud, CapSolver, 2Captcha) take the challenges a browser can't pass alone.
 - **Session Management**: Persistent session support with `FetcherSession`, `StealthySession`, and `DynamicSession` classes for cookie and state management across requests.
 - **Proxy Rotation**: Built-in `ProxyRotator` with cyclic or custom rotation strategies across all session types, plus per-request proxy overrides.
 - **Domain & Ad Blocking**: Block requests to specific domains (and their subdomains) or enable built-in ad blocking (~3,500 known ad/tracker domains) in browser-based fetchers.
@@ -456,6 +457,22 @@ async with AsyncStealthySession(max_pages=2) as session:
     results = await asyncio.gather(*tasks)
     print(session.get_pool_stats())
 ```
+
+### Anti-bot Vendors and Captcha Solvers
+```python
+from scrapling.fetchers import StealthyFetcher, StealthySession
+from scrapling.engines.antibot.solvers import SolverRouter
+
+# Detect and solve DataDome, HUMAN, Akamai, Imperva, AWS WAF, Kasada and Cloudflare challenges in the browser
+page = StealthyFetcher.fetch('https://protected-site.com/catalogue', solve_antibot=True)
+print(page.meta['antibot'])  # {'vendor': 'datadome', 'kind': 'device_check', 'solved': True, 'reason': 'solved', ...}
+
+# Hand sliders, image grids and token captchas to your own solver accounts (any one key is enough)
+router = SolverRouter.from_config({'capmonster': 'KEY', 'capsolver': 'KEY', '2captcha': 'KEY'})
+with StealthySession(solve_antibot=True, captcha_solver=router) as session:
+    page = session.fetch('https://protected-site.com/catalogue')
+```
+See the [anti-bot page](https://scrapling.readthedocs.io/en/latest/fetching/antibot.html) for the vendors, the outcome fields, and the solver routing and caps.
 
 ## CLI & Interactive Shell
 
