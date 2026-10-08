@@ -40,6 +40,10 @@ async with AsyncStealthySession() as session:
     page = await session.fetch('https://protected-site.com/catalogue', solve_antibot=True)
 ```
 
+!!! tip
+
+    Prefer turning it on for the whole session (or through `StealthyFetcher`). Only then is the browser itself launched hardened (see [Headless hardening](#headless-hardening)); turning it on for one request hardens that request's page but not the launch. Akamai, for example, blocks a headless browser whose launch switches give it away even when every page is hardened.
+
 The anti-bot pass runs after the page loads (and after the Cloudflare solver, if `solve_cloudflare` is also on) and before your `page_action`. It shares the request's `timeout` and leaves a tenth of it (between 1 and 3 seconds) for your `page_action` and for building the response. It never navigates off the target's origin, except into the vendor's own challenge frames, and it never types into anything but a vendor's widget.
 
 ## What the response tells you
