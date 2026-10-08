@@ -75,6 +75,8 @@ The reasons you will see most:
 | `blocked`, `block:<rule>`, `unsolved:root_blocked` | The request was refused, and nothing on this visit changes that. |
 | `slider`, `captcha_required...` | An interactive captcha is showing, and no captcha solver that handles it is configured (`solver_kind` says which one would). |
 | `no_challenge` | DataDome was detected from its headers alone and the page never moved on (no new cookie, no new document). |
+
+DataDome's slide-to-target slider is dragged onto its target by default. DataDome can answer a drag it does not trust with its hard-block page, which it then shows this IP for a while; to stop at that slider instead (`reason: 'slider'`) and retry later, turn dragging off with `scrapling.engines.antibot.get('datadome').drag_simple_slider = False`.
 | `still_detected` | The vendor's handler finished, but its challenge or block is still on the page. |
 | `timeout` | The deadline arrived first. |
 

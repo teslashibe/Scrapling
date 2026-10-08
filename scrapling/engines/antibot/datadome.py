@@ -285,7 +285,10 @@ class DataDomeHandler:
         not apply it before navigation. Off by default: changing the user agent, screen and window of a document
         whose device check already ran is itself a signal. Sessions should harden pages in ``page_setup``.
     :param click_confirm: Click the interstitial's "confirm" button when one is shown.
-    :param max_slider_attempts: Slider solves per visit when a solver is configured.
+    :param max_slider_attempts: Slider attempts per visit.
+    :param drag_simple_slider: Drag the slide-to-target slider onto its target (no solver needed). Off, that slider
+        ends as ``slider`` with no ``solver_kind`` (no solver can help), so a caller can retry in a fresh context
+        instead: on 2026-10-08 one live drag ended in DataDome's hard-block page.
     :param slider_kind: The solver recognition kind used for the slider.
     :param no_frame_grace: Seconds to wait for a challenge frame before deciding the check is not running.
     :param settle_timeout: Seconds to wait, after the cookie changed, for the frame and verdict to leave.
@@ -300,6 +303,7 @@ class DataDomeHandler:
         harden: bool = False,
         click_confirm: bool = True,
         max_slider_attempts: int = 2,
+        drag_simple_slider: bool = True,
         slider_kind: str = "datadome_slider",
         no_frame_grace: float = 8.0,
         settle_timeout: float = 10.0,
@@ -308,6 +312,7 @@ class DataDomeHandler:
         self.harden = harden
         self.click_confirm = click_confirm
         self.max_slider_attempts = max(0, int(max_slider_attempts))
+        self.drag_simple_slider = bool(drag_simple_slider)
         self.slider_kind = slider_kind
         self.no_frame_grace = no_frame_grace
         self.settle_timeout = settle_timeout
@@ -592,6 +597,9 @@ class DataDomeHandler:
             if waited > 6.0:
                 return SolveResult(False, "captcha", used_solver=run.used_solver)
             return None
+        if widget.get("simple") and not self.drag_simple_slider:
+            log.info("DataDome: slide-to-target slider, dragging is off")
+            return SolveResult(False, "slider")
         if solver is None and not widget.get("simple"):
             log.info("DataDome: jigsaw slider and no solver configured")
             return SolveResult(False, "slider", solver_kind=self.slider_kind)

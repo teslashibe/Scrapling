@@ -299,6 +299,17 @@ class TestCaptcha:
         assert drags and drags[-1]["ok"] and drags[-1]["trusted"]
 
     @pytest.mark.asyncio
+    async def test_slide_to_target_dragging_can_be_turned_off(self, local_frames):
+        state = local_frames.reset()
+        handler = DataDomeHandler(drag_simple_slider=False)
+        async with headless_page() as page:
+            await harden_page(page)
+            det = handler.detect(await _open(page, local_frames.url("/dd/simple")))
+            result = await handler.solve(page, det, deadline=monotonic() + 20, solver=None, log=log)
+            assert (result.solved, result.reason, result.solver_kind) == (False, "slider", None)
+        assert not [r for r in state.reports if "slider" in r]
+
+    @pytest.mark.asyncio
     async def test_wrong_answers_end_with_slider_failed(self, local_frames):
         state = local_frames.reset()
         solver = FakeSolver(state.gap + 120)  # always 60 CSS px off
