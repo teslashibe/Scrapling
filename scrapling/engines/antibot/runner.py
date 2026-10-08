@@ -305,7 +305,7 @@ async def solve_page(
     if callable(summary):
         try:
             used = summary()
-            if used.get("attempts"):
+            if isinstance(used, dict) and used.get("attempts"):
                 outcome["solver"] = used
         except Exception:  # pragma: no cover - a custom solver object
             pass
