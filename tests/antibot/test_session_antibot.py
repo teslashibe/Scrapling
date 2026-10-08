@@ -373,6 +373,17 @@ class TestAsyncSession:
             assert solved.meta["antibot"]["solved"] is True
 
     @pytest.mark.asyncio
+    async def test_a_failing_pass_never_fails_the_fetch(self, iak, monkeypatch):
+        async def broken(*args, **kwargs):
+            raise RuntimeError("detector exploded")
+
+        monkeypatch.setattr(runner, "solve_page", broken)
+        async with AsyncStealthySession(**_session_kwargs(solve_antibot=True)) as session:
+            response = await session.fetch(iak.url("/missing"))
+        assert response.status == 404
+        assert (response.meta["antibot"]["solved"], response.meta["antibot"]["reason"]) == (False, "error:RuntimeError")
+
+    @pytest.mark.asyncio
     async def test_hardened_session_passes_datadomes_frame_consistency_check(self, dd_frames):
         state = dd_frames.reset()
         async with AsyncStealthySession(**_session_kwargs(solve_antibot=True)) as session:

@@ -35,6 +35,7 @@ from scrapling.engines.antibot.headless import harden_page, quiet_evaluate
 __all__ = [
     "MAX_LAYERS",
     "antibot_deadline",
+    "error_outcome",
     "prepare_page",
     "read_signal",
     "release_page",
@@ -157,6 +158,19 @@ async def read_signal(
         html=html if isinstance(html, str) else "",
         frame_urls=frames,
     )
+
+
+def error_outcome(error: BaseException) -> Dict[str, Any]:
+    """The ``response.meta["antibot"]`` value when the anti-bot pass itself failed (the fetch still returns)."""
+    return {
+        "vendor": None,
+        "kind": None,
+        "rule": None,
+        "solved": False,
+        "reason": f"error:{type(error).__name__}",
+        "layers": [],
+        "elapsed_s": 0.0,
+    }
 
 
 def _layer(det: Detection, result: SolveResult, elapsed: float) -> Dict[str, Any]:

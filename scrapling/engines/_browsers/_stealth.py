@@ -342,7 +342,7 @@ class StealthySession(SyncSession, StealthySessionMixin):
     ) -> Dict[str, Any]:
         """Detect a bot-protection vendor on the loaded page and solve it within the fetch's timeout."""
         from scrapling.engines.antibot._sync_bridge import run_sync, wrap
-        from scrapling.engines.antibot.runner import antibot_deadline, solve_page
+        from scrapling.engines.antibot.runner import antibot_deadline, error_outcome, solve_page
 
         try:
             return run_sync(
@@ -355,6 +355,9 @@ class StealthySession(SyncSession, StealthySessionMixin):
                     log=log,
                 ),
             )
+        except Exception as e:
+            log.error(f"Error in the anti-bot pass: {e}")
+            return error_outcome(e)
         finally:
             # Handlers shorten the page's timeouts to their deadline; give the rest of the fetch its own back.
             page.set_default_navigation_timeout(params.timeout)
@@ -682,7 +685,7 @@ class AsyncStealthySession(AsyncSession, StealthySessionMixin):
         self, page: async_Page, first_response: Any, final_response: List, params: Any, started: float
     ) -> Dict[str, Any]:
         """Detect a bot-protection vendor on the loaded page and solve it within the fetch's timeout."""
-        from scrapling.engines.antibot.runner import antibot_deadline, solve_page
+        from scrapling.engines.antibot.runner import antibot_deadline, error_outcome, solve_page
 
         try:
             return await solve_page(
@@ -692,6 +695,9 @@ class AsyncStealthySession(AsyncSession, StealthySessionMixin):
                 solver=params.captcha_solver,
                 log=log,
             )
+        except Exception as e:
+            log.error(f"Error in the anti-bot pass: {e}")
+            return error_outcome(e)
         finally:
             # Handlers shorten the page's timeouts to their deadline; give the rest of the fetch its own back.
             page.set_default_navigation_timeout(params.timeout)
